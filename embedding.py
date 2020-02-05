@@ -16,7 +16,7 @@ parser.add_argument('--embedding-size', type=int, default=32,
                     help="Size of source and target embedding")
 parser.add_argument('--sequence-length', type=int, default=128,
                     help="Size of input length (by padding or truncating)")
-parser.add_argument('--vocab-size', type=int, default=15000,
+parser.add_argument('--vocab-size', type=int, default=10000,
                     help="Size of vocab")
 parser.add_argument('--steps', type=int, default=50000,
                     help="Number of steps to complete in training")
@@ -49,5 +49,6 @@ with tf.Session() as sess:
     sess.run(tf.global_variables_initializer())
     embedding_output,embedding_table = sess.run(batch,feed_dict = {input_ids: input_t})
     print (embedding_output)
+    print (embedding_table.shape)
     raw_reports = sess.run(report)
     save_tf_report(raw_reports)
