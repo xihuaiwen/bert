@@ -9,11 +9,11 @@ from tensorflow.compiler.plugin.poplar.ops import gen_ipu_ops
 from gcprofile import save_tf_report
 
 
-
 import argparse
 
-
 parser = argparse.ArgumentParser(description='NMT model in TensorFlow to run on the IPU')
+parser.add_argument('--epochs', type=int, default=1,
+                            help="batch-size")
 parser.add_argument('--batch-size', type=int, default=1,
                             help="Set batch-size")
 parser.add_argument('--learning-rate', type=float, default=5e-5,
@@ -44,22 +44,35 @@ parser.add_argument('--profiling', type=bool, default=True,
                             help="Whether to enable profiling")
 
 args = parser.parse_args()
+intermediate_act_fn=modeling.gelu
 
-"""
-batch_size = 1
-seq_length = 128
-hidden_size = 768
-vocab_size = 28996
-hidden_size=768
-num_hidden_layers=12
-num_attention_heads=12
-intermediate_size=3072
-intermediate_act_fn=modeling.gelu
-hidden_dropout_prob=0.1
-attention_probs_dropout_prob=0.1
-initializer_range=0.02
-"""
-intermediate_act_fn=modeling.gelu
+class Dataset:
+    def __init__(self,num_items):
+        self.num_items = num_items
+        self.data = []
+        for i in range(0,self.num_items):
+            _input_tensor = np.random.rand(args.batch_size, args.seq_length, args.hidden_size)
+            _attention_mask = np.random.randint(args.seq_length, size=(args.batch_size, args.seq_length, args.seq_length))
+            _embedding_table = np.random.rand(args.vocab_size,args.hidden_size)
+            _masked_lm_positions = np.random.randint(args.seq_length,size=(args.max_predictions_per_seq))
+            _masked_lm_ids       = np.random.randint(args.seq_length,size=(args.max_predictions_per_seq))
+            _masked_lm_weights   = np.random.rand(args.max_predictions_per_seq)
+            _next_sentence_labels = np.random.randint(1000,size=1)
+            self.data.append((_input_tensor,
+                            _attention_mask,
+                            _embedding_table,
+                            _masked_lm_positions,
+                            _masked_lm_ids,
+                            _masked_lm_weights,
+                            _next_sentence_labels))
+
+    def __getitem__(self,index):
+        return self.data[index]
+    def __iter__(self):
+        return (self[index] for index in range(self.num_items))
+    def __len__(self):
+        return self.num_items
+        
 
 
 def embedding_graph(input_ids):
@@ -273,13 +286,8 @@ opts = utils.create_ipu_config(profiling=args.profiling,profile_execution=args.p
 cfg = utils.auto_select_ipus(opts,1)
 ipu.utils.configure_ipu_system(cfg)
 
+data = Dataset(10)
 
-_input_tensor = np.random.rand(args.batch_size, args.seq_length, args.hidden_size)
-_attention_mask = np.random.randint(args.seq_length, size=(args.batch_size, args.seq_length, args.seq_length))
-_embedding_table = np.random.rand(args.vocab_size,args.hidden_size)
-_masked_lm_positions = np.random.randint(args.seq_length,size=(args.max_predictions_per_seq))
-_masked_lm_ids       = np.random.randint(args.seq_length,size=(args.max_predictions_per_seq))
-_masked_lm_weights   = np.random.rand(args.max_predictions_per_seq)
 _next_sentence_labels = np.random.randint([1])
 tvars = tf.trainable_variables()
 tf.logging.info("**** Trainable Variables ****")
@@ -293,14 +301,23 @@ with tf.device('cpu'):
 
 with tf.Session() as sess:
     sess.run(tf.global_variables_initializer())
-    layer_output = sess.run(batch,feed_dict = {input_tensor:_input_tensor,
+    for i in range(0,args.epochs):
+        j = 0
+        for (_input_tensor,
+            _attention_mask,
+            _embedding_table,
+            _masked_lm_positions,
+            _masked_lm_ids,
+            _masked_lm_weights,
+            _next_sentence_labels)  in data:
+            layer_output = sess.run(batch,feed_dict = {input_tensor:_input_tensor,
                                             attention_mask:_attention_mask,
                                             embedding_table:_embedding_table,
                                             masked_lm_positions:_masked_lm_positions,
                                             masked_lm_ids:_masked_lm_ids,
                                             masked_lm_weights:_masked_lm_weights,
                                             next_sentence_labels:_next_sentence_labels})
-                
-    print (layer_output)
+            print ("processing #%d" % (j))
+            j+=1
     raw_reports = sess.run(report)
     save_tf_report(raw_reports)
