@@ -1,7 +1,7 @@
 import numpy as np
 import tensorflow as tf
 from tensorflow.python.ipu.scopes import ipu_scope
-from tensorflow.python.ipu import utils
+from tensorflow.python.ipu import utils, scopes
 from tensorflow.python import ipu
 import modeling
 import optimization
@@ -90,97 +90,98 @@ def attention(input_tensor,attention_mask,
                     positions that should not be.
         hidden_size: int. Hidden size of the Transformer.
     """
-    input_shape = modeling.get_shape_list(input_tensor, expected_rank=3)
-
-    layer_idx = 0
-    attention_head_size = int(args.hidden_size / args.num_attention_heads)
-    prev_output = modeling.reshape_to_matrix(input_tensor)
-    with tf.variable_scope("layer_%d" % layer_idx):
-      layer_input = prev_output
-      with tf.variable_scope("attention"):
-        attention_heads = []
-        with tf.variable_scope("self"):
-          attention_head = modeling.attention_layer(
-              from_tensor=layer_input,
-              to_tensor=layer_input,
-              attention_mask=attention_mask,
-              num_attention_heads=args.num_attention_heads,
-              size_per_head=attention_head_size,
-              attention_probs_dropout_prob=args.attention_probs_dropout_prob,
-              initializer_range=args.initializer_range,
-              do_return_2d_tensor=True,
-              batch_size=args.batch_size,
-              from_seq_length=args.seq_length,
-              to_seq_length=args.seq_length)
-          attention_heads.append(attention_head)
-
-        attention_output = None
-        if len(attention_heads) == 1:
-          attention_output = attention_heads[0]
-        else:
-          # In the case where we have other sequences, we just concatenate
-          # them to the self-attention head before the projection.
-          attention_output = tf.concat(attention_heads, axis=-1)
-
-        # Run a linear projection of `hidden_size` then add a residual
-        # with `layer_input`.
-        with tf.variable_scope("output"):
-          attention_output = tf.layers.dense(
-              attention_output,
-              args.hidden_size,
-              kernel_initializer=modeling.create_initializer(args.initializer_range))
-          attention_output = modeling.dropout(attention_output, args.hidden_dropout_prob)
-          attention_output = modeling.layer_norm(attention_output + layer_input)
-
-      # The activation is only applied to the "intermediate" hidden layer.
-      with tf.variable_scope("intermediate"):
-        intermediate_output = tf.layers.dense(
-            attention_output,
-            args.intermediate_size,
-            activation=intermediate_act_fn,
-            kernel_initializer=modeling.create_initializer(args.initializer_range))
-
-      # Down-project back to `hidden_size` then add the residual.
-      with tf.variable_scope("output"):
-        layer_output = tf.layers.dense(
-            intermediate_output,
-            args.hidden_size,
-            kernel_initializer=modeling.create_initializer(args.initializer_range))
-        layer_output = modeling.dropout(layer_output, args.hidden_dropout_prob)
-        layer_output = modeling.layer_norm(layer_output + attention_output)
-        prev_output = layer_output
-
-
-        final_output = modeling.reshape_from_matrix(prev_output, input_shape)
-        #since in modeling.py the transformer_model return all layer output 
-        # we can comment following line 
-        #sequence_output = final_output[-1]
-        sequence_output = final_output
+    with scopes.ipu_shard(0):
+        input_shape = modeling.get_shape_list(input_tensor, expected_rank=3)
     
-      with tf.variable_scope("pooler"):
-        # We "pool" the model by simply taking the hidden state corresponding
-        # to the first token. We assume that this has been pre-trained
-        first_token_tensor = tf.squeeze(sequence_output[:, 0:1, :], axis=1)
-        pooled_output = tf.layers.dense(
-            first_token_tensor,
-            args.hidden_size,
-            activation=tf.tanh,
-            kernel_initializer=modeling.create_initializer(args.initializer_range))
-
-     ### caculate the loss
-    (masked_lm_loss, masked_lm_example_loss, masked_lm_log_probs) = get_masked_lm_output(
-         sequence_output, embedding_table,
-         masked_lm_positions, masked_lm_ids, masked_lm_weights)
-
-    (next_sentence_loss, next_sentence_example_loss, next_sentence_log_probs) = get_next_sentence_output(
-         pooled_output, next_sentence_labels)
-
-    total_loss = masked_lm_loss + next_sentence_loss
-
-    optimiser = tf.train.GradientDescentOptimizer(0.01)
-    optimiser.minimize(total_loss)
+        layer_idx = 0
+        attention_head_size = int(args.hidden_size / args.num_attention_heads)
+        prev_output = modeling.reshape_to_matrix(input_tensor)
+        with tf.variable_scope("layer_%d" % layer_idx):
+          layer_input = prev_output
+          with tf.variable_scope("attention"):
+            attention_heads = []
+            with tf.variable_scope("self"):
+              attention_head = modeling.attention_layer(
+                  from_tensor=layer_input,
+                  to_tensor=layer_input,
+                  attention_mask=attention_mask,
+                  num_attention_heads=args.num_attention_heads,
+                  size_per_head=attention_head_size,
+                  attention_probs_dropout_prob=args.attention_probs_dropout_prob,
+                  initializer_range=args.initializer_range,
+                  do_return_2d_tensor=True,
+                  batch_size=args.batch_size,
+                  from_seq_length=args.seq_length,
+                  to_seq_length=args.seq_length)
+              attention_heads.append(attention_head)
+    
+            attention_output = None
+            if len(attention_heads) == 1:
+              attention_output = attention_heads[0]
+            else:
+              # In the case where we have other sequences, we just concatenate
+              # them to the self-attention head before the projection.
+              attention_output = tf.concat(attention_heads, axis=-1)
+    
+            # Run a linear projection of `hidden_size` then add a residual
+            # with `layer_input`.
+            with tf.variable_scope("output"):
+              attention_output = tf.layers.dense(
+                  attention_output,
+                  args.hidden_size,
+                  kernel_initializer=modeling.create_initializer(args.initializer_range))
+              attention_output = modeling.dropout(attention_output, args.hidden_dropout_prob)
+              attention_output = modeling.layer_norm(attention_output + layer_input)
+    
+          # The activation is only applied to the "intermediate" hidden layer.
+          with tf.variable_scope("intermediate"):
+            intermediate_output = tf.layers.dense(
+                attention_output,
+                args.intermediate_size,
+                activation=intermediate_act_fn,
+                kernel_initializer=modeling.create_initializer(args.initializer_range))
+    
+          # Down-project back to `hidden_size` then add the residual.
+          with tf.variable_scope("output"):
+            layer_output = tf.layers.dense(
+                intermediate_output,
+                args.hidden_size,
+                kernel_initializer=modeling.create_initializer(args.initializer_range))
+            layer_output = modeling.dropout(layer_output, args.hidden_dropout_prob)
+            layer_output = modeling.layer_norm(layer_output + attention_output)
+            prev_output = layer_output
+    
+        with scopes.ipu_shard(1):
+            final_output = modeling.reshape_from_matrix(prev_output, input_shape)
+            #since in modeling.py the transformer_model return all layer output 
+            # we can comment following line 
+            #sequence_output = final_output[-1]
+            sequence_output = final_output
         
-    return layer_output,total_loss
+            with tf.variable_scope("pooler"):
+            # We "pool" the model by simply taking the hidden state corresponding
+            # to the first token. We assume that this has been pre-trained
+                first_token_tensor = tf.squeeze(sequence_output[:, 0:1, :], axis=1)
+                pooled_output = tf.layers.dense(
+                    first_token_tensor,
+                    args.hidden_size,
+                    activation=tf.tanh,
+                    kernel_initializer=modeling.create_initializer(args.initializer_range))
+    
+            ### caculate the loss
+            (masked_lm_loss, masked_lm_example_loss, masked_lm_log_probs) = get_masked_lm_output(
+                sequence_output, embedding_table,
+                masked_lm_positions, masked_lm_ids, masked_lm_weights)
+    
+            (next_sentence_loss, next_sentence_example_loss, next_sentence_log_probs) = get_next_sentence_output(
+                pooled_output, next_sentence_labels)
+    
+            total_loss = masked_lm_loss + next_sentence_loss
+    
+            optimiser = tf.train.GradientDescentOptimizer(0.01)
+            optimiser.minimize(total_loss)
+            
+            return layer_output,total_loss
 
 
 def get_masked_lm_output(input_tensor, output_weights, positions,
@@ -283,7 +284,7 @@ with ipu_scope("/device:IPU:0"):
 
 
 opts = utils.create_ipu_config(profiling=args.profiling,profile_execution=args.profiling)
-cfg = utils.auto_select_ipus(opts,1)
+cfg = utils.auto_select_ipus(opts,2)
 ipu.utils.configure_ipu_system(cfg)
 
 data = Dataset(10)
