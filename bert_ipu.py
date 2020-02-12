@@ -44,6 +44,8 @@ parser.add_argument('--initializer-range', type=float, default=0.02,
                             help="propotion of initializer range")
 parser.add_argument('--profiling', type=bool, default=True,
                             help="Whether to enable profiling")
+parser.add_argument('--poplar-text-report', type=bool, default=True,
+                                    help="Whether to save poplar text report rather than in Json")
 
 args = parser.parse_args()
 intermediate_act_fn=modeling.gelu
@@ -56,9 +58,9 @@ class Dataset:
             _input_ids = np.random.randint(args.vocab_size, size=(args.batch_size, args.seq_length))
             _input_mask = np.random.randint(args.vocab_size, size=(args.batch_size, args.seq_length))
             _token_type_ids = np.random.randint(args.vocab_size, size=(args.batch_size, args.seq_length))
-            _masked_lm_positions = np.random.randint(args.seq_length,size=(args.max_predictions_per_seq))
-            _masked_lm_ids       = np.random.randint(args.seq_length,size=(args.max_predictions_per_seq))
-            _masked_lm_weights   = np.random.rand(args.max_predictions_per_seq)
+            _masked_lm_positions = np.random.randint(args.seq_length,size=(args.batch_size,args.max_predictions_per_seq))
+            _masked_lm_ids       = np.random.randint(args.seq_length,size=(args.batch_size,args.max_predictions_per_seq))
+            _masked_lm_weights   = np.random.rand(args.batch_size,args.max_predictions_per_seq)
             _next_sentence_labels = np.random.randint(1000,size=1)
             self.data.append((_input_ids,
                             _input_mask,
@@ -227,7 +229,7 @@ def bert_model(input_ids,input_mask,token_type_ids,
           pooled_output, next_sentence_labels)
 
       total_loss = masked_lm_loss + next_sentence_loss
-  
+
       opt = sharded_optimizer.ShardedOptimizer(
                             gradient_descent.GradientDescentOptimizer(args.learning_rate))
       train_op = opt.minimize(total_loss)
@@ -322,9 +324,9 @@ with ipu_scope("/device:IPU:0"):
     input_mask = tf.placeholder(tf.int32,shape=(args.batch_size, args.seq_length),name='input_mask')
     token_type_ids = tf.placeholder(tf.int32,shape=(args.batch_size, args.seq_length),name='token_type_ids')
 
-    masked_lm_positions = tf.placeholder(tf.int32,shape=(args.max_predictions_per_seq),name="masked_lm_positions") 
-    masked_lm_ids = tf.placeholder(tf.int32,shape=(args.max_predictions_per_seq),name="masked_lm_ids")
-    masked_lm_weights = tf.placeholder(tf.float32,shape=(args.max_predictions_per_seq),name="masked_lm_weights")
+    masked_lm_positions = tf.placeholder(tf.int32,shape=(args.batch_size,args.max_predictions_per_seq),name="masked_lm_positions")
+    masked_lm_ids = tf.placeholder(tf.int32,shape=(args.batch_size,args.max_predictions_per_seq),name="masked_lm_ids")
+    masked_lm_weights = tf.placeholder(tf.float32,shape=(args.batch_size,args.max_predictions_per_seq),name="masked_lm_weights")
     next_sentence_labels = tf.placeholder(tf.int32,shape=(1),name="next_sentence_labels")
     batch = ipu.ipu_compiler.compile(bert_model, [input_ids,
                                                 input_mask,
@@ -335,9 +337,9 @@ with ipu_scope("/device:IPU:0"):
                                                 next_sentence_labels])
 
 
-opts = utils.create_ipu_config(profiling=args.profiling,profile_execution=args.profiling)
-opts = utils.set_convolution_options(opts, {"availableMemoryProportion": "0.4"})
-opts = utils.set_matmul_options(opts,{"availableMemoryProportion": "0.4"})
+opts = utils.create_ipu_config(profiling=args.profiling,profile_execution=args.profiling,use_poplar_text_report=args.poplar_text_report)
+opts = utils.set_convolution_options(opts, {"availableMemoryProportion": "0.23"})
+opts = utils.set_matmul_options(opts,{"availableMemoryProportion": "0.23"})
 utils.set_recomputation_options(opts, allow_recompute=False)
 cfg = utils.auto_select_ipus(opts,calculate_required_ipu())
 ipu.utils.configure_ipu_system(cfg)
@@ -377,4 +379,9 @@ with tf.Session() as sess:
             print ("processing #%d" % (j))
             j+=1
     raw_reports = sess.run(report)
-    save_tf_report(raw_reports)
+    if args.poplar_text_report:
+        rep = ipu.utils.extract_all_strings_from_event_trace(raw_reports)
+        with open("test_report.txt","w") as f:
+            f.write(rep)
+    else:
+        save_tf_report(raw_reports)
