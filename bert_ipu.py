@@ -9,6 +9,7 @@ from tensorflow.compiler.plugin.poplar.ops import gen_ipu_ops
 from gcprofile import save_tf_report
 from tensorflow.python.ipu.optimizers import sharded_optimizer
 from tensorflow.python.training import gradient_descent
+import tensorflow.contrib.slim as slim
 
 import argparse
 
@@ -21,7 +22,7 @@ parser.add_argument('--learning-rate', type=float, default=5e-5,
                             help="the initial learning rate")
 parser.add_argument('--seq-length', type=int, default=128,
                             help="Size of input length (by padding or truncating)")
-parser.add_argument('--vocab-size', type=int, default=100,
+parser.add_argument('--vocab-size', type=int, default=3000,
                             help="Size of vocab")
 parser.add_argument('--steps', type=int, default=50000,
                             help="Number of steps to complete in training")
@@ -31,7 +32,7 @@ parser.add_argument('--num-attention-heads', type=int, default=12,
                             help="Number of attention heads")
 parser.add_argument('--max_predictions_per_seq', type=int, default=20,
                             help="Maximum number of masked LM predictions per sequence.")
-parser.add_argument('--hidden-size', type=int, default=144,
+parser.add_argument('--hidden-size', type=int, default=768,
                             help="Number of hidden size")
 parser.add_argument('--intermediate-size', type=int, default=3072,
                             help="size of intermediate")
@@ -74,6 +75,9 @@ class Dataset:
     def __len__(self):
         return self.num_items
         
+def model_summary():
+    model_vars = tf.trainable_variables()
+    slim.model_analyzer.analyze_vars(model_vars, print_info=True)
 
 def calculate_required_ipu():
     num_shards = args.num_hidden_layers + 2
@@ -332,6 +336,9 @@ with ipu_scope("/device:IPU:0"):
 
 
 opts = utils.create_ipu_config(profiling=args.profiling,profile_execution=args.profiling)
+opts = utils.set_convolution_options(opts, {"availableMemoryProportion": "0.4"})
+opts = utils.set_matmul_options(opts,{"availableMemoryProportion": "0.4"})
+utils.set_recomputation_options(opts, allow_recompute=False)
 cfg = utils.auto_select_ipus(opts,calculate_required_ipu())
 ipu.utils.configure_ipu_system(cfg)
 
@@ -349,6 +356,7 @@ with tf.device('cpu'):
     report = gen_ipu_ops.ipu_event_trace()
 
 with tf.Session() as sess:
+    model_summary()
     sess.run(tf.global_variables_initializer())
     for i in range(0,args.epochs):
         j = 0
