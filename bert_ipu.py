@@ -234,8 +234,7 @@ def bert_model(input_ids,input_mask,token_type_ids,
                             gradient_descent.GradientDescentOptimizer(args.learning_rate))
       train_op = opt.minimize(total_loss)
         
-  return layer_output,train_op
-
+  return embedding_output,embedding_table,attention_mask,sequence_output,train_op
 
 def get_masked_lm_output(input_tensor, output_weights, positions,
                          label_ids, label_weights):
@@ -258,6 +257,7 @@ def get_masked_lm_output(input_tensor, output_weights, positions,
     # an output-only bias for each token.
     output_bias = tf.get_variable(
         "output_bias",
+        dtype=tf.float16,
         shape=[args.vocab_size],
         initializer=tf.zeros_initializer())
     logits = tf.matmul(input_tensor, output_weights, transpose_b=True)
@@ -266,9 +266,10 @@ def get_masked_lm_output(input_tensor, output_weights, positions,
 
     label_ids = tf.reshape(label_ids, [-1])
     label_weights = tf.reshape(label_weights, [-1])
+    label_weights = tf.cast(label_weights,dtype=tf.float16)
 
     one_hot_labels = tf.one_hot(
-        label_ids, depth=args.vocab_size, dtype=tf.float32)
+        label_ids, depth=args.vocab_size, dtype=tf.float16)
 
     # The `positions` tensor might be zero-padded (if the sequence is too
     # short to have the maximum number of predictions). The `label_weights`
@@ -290,16 +291,19 @@ def get_next_sentence_output(input_tensor, labels):
   with tf.variable_scope("cls/seq_relationship"):
     output_weights = tf.get_variable(
         "output_weights",
+        dtype=tf.float16,
         shape=[2, args.hidden_size],
         initializer=modeling.create_initializer(args.initializer_range))
     output_bias = tf.get_variable(
-        "output_bias", shape=[2], initializer=tf.zeros_initializer())
+        "output_bias",
+        dtype=tf.float16,
+        shape=[2], initializer=tf.zeros_initializer())
 
     logits = tf.matmul(input_tensor, output_weights, transpose_b=True)
     logits = tf.nn.bias_add(logits, output_bias)
     log_probs = tf.nn.log_softmax(logits, axis=-1)
     labels = tf.reshape(labels, [-1])
-    one_hot_labels = tf.one_hot(labels, depth=2, dtype=tf.float32)
+    one_hot_labels = tf.one_hot(labels, depth=2, dtype=tf.float16)
     per_example_loss = -tf.reduce_sum(one_hot_labels * log_probs, axis=-1)
     loss = tf.reduce_mean(per_example_loss)
     return (loss, per_example_loss, log_probs)
@@ -369,7 +373,7 @@ with tf.Session() as sess:
             _masked_lm_ids,
             _masked_lm_weights,
             _next_sentence_labels)  in data:
-            layer_output = sess.run(batch,feed_dict = {input_ids:_input_ids,
+            embedding_output,embedding_table,attention_mask,sequence_output = sess.run(batch,feed_dict = {input_ids:_input_ids,
                                             input_mask:_input_mask,
                                             token_type_ids:_token_type_ids,
                                             masked_lm_positions:_masked_lm_positions,
@@ -378,6 +382,10 @@ with tf.Session() as sess:
                                             next_sentence_labels:_next_sentence_labels})
             print ("processing #%d" % (j))
             j+=1
+            print (embedding_output.shape)
+            print (embedding_table.shape)
+            print (attention_mask.shape)
+            print (sequence_output.shape)
     raw_reports = sess.run(report)
     if args.poplar_text_report:
         rep = ipu.utils.extract_all_strings_from_event_trace(raw_reports)
