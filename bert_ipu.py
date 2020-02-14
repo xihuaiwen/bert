@@ -1,4 +1,5 @@
 import numpy as np
+import math
 import tensorflow as tf
 from tensorflow.python.ipu.scopes import ipu_scope
 from tensorflow.python.ipu import utils, scopes
@@ -82,7 +83,7 @@ def model_summary():
     slim.model_analyzer.analyze_vars(model_vars, print_info=True)
 
 def calculate_required_ipu():
-    num_shards = args.num_hidden_layers + 2
+    num_shards = math.floor(args.num_hidden_layers/2) + 2
     i = 0
     num_ipus_list = [2,4,8,16]
     for nums in num_ipus_list:
@@ -148,7 +149,7 @@ def bert_model(input_ids,input_mask,token_type_ids,
         embedding on IPU subgraph #0
         loss caculation on IPU subgraph #1
     """
-    with scopes.ipu_shard(layer_idx + 1):
+    with scopes.ipu_shard(math.floor(layer_idx/2) + 1):
       with tf.variable_scope("layer_%d" % layer_idx):
         layer_input = prev_output
   
@@ -204,7 +205,7 @@ def bert_model(input_ids,input_mask,token_type_ids,
           layer_output = modeling.layer_norm(layer_output + attention_output)
           prev_output = layer_output
 
-  with scopes.ipu_shard(1 + args.num_hidden_layers):
+  with scopes.ipu_shard(math.floor(args.num_hidden_layers/2) + 1):
       final_output = modeling.reshape_from_matrix(prev_output, input_shape)
       #since in modeling.py the transformer_model return all layer output 
       # we can comment following line 
