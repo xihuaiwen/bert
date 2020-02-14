@@ -26,6 +26,7 @@ import re
 import numpy as np
 import six
 import tensorflow as tf
+from tensorflow.python.ipu.ops.embedding_ops import embedding_lookup as embedding_lookup_ipu
 
 
 class BertConfig(object):
@@ -413,12 +414,15 @@ def embedding_lookup(input_ids,
       initializer=create_initializer(initializer_range))
 
   flat_input_ids = tf.reshape(input_ids, [-1])
+
+  """
   if use_one_hot_embeddings:
     one_hot_input_ids = tf.one_hot(flat_input_ids, depth=vocab_size)
     output = tf.matmul(one_hot_input_ids, embedding_table)
   else:
     output = tf.gather(embedding_table, flat_input_ids)
-
+  """
+  output = embedding_lookup_ipu(embedding_table ,flat_input_ids , name=f'emb_lookup_ipu') 
   input_shape = get_shape_list(input_ids)
 
   output = tf.reshape(output,

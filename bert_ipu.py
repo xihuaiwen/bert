@@ -140,6 +140,7 @@ def bert_model(input_ids,input_mask,token_type_ids,
     # the GPU/CPU but may not be free on the TPU, so we want to minimize them to
                               # help the optimizer.
     prev_output = modeling.reshape_to_matrix(embedding_output)
+    embedding_output = tf.stop_gradient(embedding_output)
 
   for layer_idx in range(args.num_hidden_layers):
     """
@@ -214,12 +215,11 @@ def bert_model(input_ids,input_mask,token_type_ids,
       # We "pool" the model by simply taking the hidden state corresponding
       # to the first token. We assume that this has been pre-trained
           first_token_tensor = tf.squeeze(sequence_output[:, 0:1, :], axis=1)
-          pooled_output = tf.layers.dense(
+          pooled_output = tf.stop_gradient (tf.layers.dense(
               first_token_tensor,
               args.hidden_size,
               activation=tf.tanh,
-              kernel_initializer=modeling.create_initializer(args.initializer_range))
-
+              kernel_initializer=modeling.create_initializer(args.initializer_range)))
       ### caculate the loss
       (masked_lm_loss, masked_lm_example_loss, masked_lm_log_probs) = get_masked_lm_output(
           sequence_output, embedding_table,
@@ -260,6 +260,8 @@ def get_masked_lm_output(input_tensor, output_weights, positions,
         dtype=tf.float16,
         shape=[args.vocab_size],
         initializer=tf.zeros_initializer())
+    input_tensor = tf.stop_gradient(input_tensor)
+    output_weights = tf.stop_gradient(output_weights)
     logits = tf.matmul(input_tensor, output_weights, transpose_b=True)
     logits = tf.nn.bias_add(logits, output_bias)
     log_probs = tf.nn.log_softmax(logits, axis=-1)
