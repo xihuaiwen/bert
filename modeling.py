@@ -26,6 +26,7 @@ import re
 import numpy as np
 import six
 import tensorflow as tf
+from tensorflow.python import ipu
 from tensorflow.python.ipu.ops.embedding_ops import embedding_lookup as embedding_lookup_ipu
 
 
@@ -356,7 +357,8 @@ def dropout(input_tensor, dropout_prob):
   if dropout_prob is None or dropout_prob == 0.0:
     return input_tensor
 
-  output = tf.nn.dropout(input_tensor, 1.0 - dropout_prob)
+  #output = tf.nn.dropout(input_tensor, 1.0 - dropout_prob)
+  output = ipu.ops.rand_ops.dropout(input_tensor, rate=dropout_prob)
   return output
 
 
@@ -422,7 +424,7 @@ def embedding_lookup(input_ids,
   else:
     output = tf.gather(embedding_table, flat_input_ids)
   """
-  output = embedding_lookup_ipu(embedding_table ,flat_input_ids , name=f'emb_lookup_ipu') 
+  output = embedding_lookup_ipu(embedding_table ,flat_input_ids , name=f'emb_lookup_ipu_words') 
   input_shape = get_shape_list(input_ids)
 
   output = tf.reshape(output,
@@ -486,8 +488,13 @@ def embedding_postprocessor(input_tensor,
     # This vocab will be small so we always do one-hot here, since it is always
     # faster for a small vocabulary.
     flat_token_type_ids = tf.reshape(token_type_ids, [-1])
+    
+    """
     one_hot_ids = tf.one_hot(flat_token_type_ids, depth=token_type_vocab_size, dtype=tf.float16)
     token_type_embeddings = tf.matmul(one_hot_ids, token_type_table)
+    """
+
+    token_type_embeddings = embedding_lookup_ipu(token_type_table ,flat_token_type_ids , name=f'emb_lookup_ipu_token_type') 
     token_type_embeddings = tf.reshape(token_type_embeddings,
                                        [batch_size, seq_length, width])
     output += token_type_embeddings

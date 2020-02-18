@@ -83,7 +83,7 @@ def model_summary():
     slim.model_analyzer.analyze_vars(model_vars, print_info=True)
 
 def calculate_required_ipu():
-    num_shards = math.floor(args.num_hidden_layers/2) + 2
+    num_shards = int (math.ceil(args.num_hidden_layers/2.0)) + 2
     i = 0
     num_ipus_list = [2,4,8,16]
     for nums in num_ipus_list:
@@ -104,6 +104,7 @@ def bert_model(input_ids,input_mask,token_type_ids,
                                          word_embedding_name = "word_embeddings",
                                          use_one_hot_embeddings = False
                                          )
+  with scopes.ipu_shard(1):
     embedding_output = modeling.embedding_postprocessor(
                          input_tensor = embedding_output,
                          use_token_type=True,
@@ -149,7 +150,7 @@ def bert_model(input_ids,input_mask,token_type_ids,
         embedding on IPU subgraph #0
         loss caculation on IPU subgraph #1
     """
-    with scopes.ipu_shard(math.floor(layer_idx/2) + 1):
+    with scopes.ipu_shard(int(math.floor(layer_idx/2.0)) + 2):
       with tf.variable_scope("layer_%d" % layer_idx):
         layer_input = prev_output
   
@@ -204,14 +205,20 @@ def bert_model(input_ids,input_mask,token_type_ids,
           layer_output = modeling.dropout(layer_output, args.hidden_dropout_prob)
           layer_output = modeling.layer_norm(layer_output + attention_output)
           prev_output = layer_output
+	
+        if layer_idx == args.num_hidden_layers - 1:
+          final_output = modeling.reshape_from_matrix(prev_output, input_shape)
+          #since in modeling.py the transformer_model return all layer output 
+          # we can comment following line 
+          #sequence_output = final_output[-1]
+          sequence_output = final_output
 
-  with scopes.ipu_shard(math.floor(args.num_hidden_layers/2) + 1):
-      final_output = modeling.reshape_from_matrix(prev_output, input_shape)
-      #since in modeling.py the transformer_model return all layer output 
-      # we can comment following line 
-      #sequence_output = final_output[-1]
-      sequence_output = final_output
-  
+  with scopes.ipu_shard(0):
+      (masked_lm_loss, masked_lm_example_loss, masked_lm_log_probs) = get_masked_lm_output(
+          sequence_output, embedding_table,
+          masked_lm_positions, masked_lm_ids, masked_lm_weights)
+
+  with scopes.ipu_shard(1):
       with tf.variable_scope("pooler"):
       # We "pool" the model by simply taking the hidden state corresponding
       # to the first token. We assume that this has been pre-trained
@@ -221,19 +228,16 @@ def bert_model(input_ids,input_mask,token_type_ids,
               args.hidden_size,
               activation=tf.tanh,
               kernel_initializer=modeling.create_initializer(args.initializer_range)))
-      ### caculate the loss
-      (masked_lm_loss, masked_lm_example_loss, masked_lm_log_probs) = get_masked_lm_output(
-          sequence_output, embedding_table,
-          masked_lm_positions, masked_lm_ids, masked_lm_weights)
 
+      ### caculate the loss
       (next_sentence_loss, next_sentence_example_loss, next_sentence_log_probs) = get_next_sentence_output(
           pooled_output, next_sentence_labels)
 
       total_loss = masked_lm_loss + next_sentence_loss
 
-      opt = sharded_optimizer.ShardedOptimizer(
+  opt = sharded_optimizer.ShardedOptimizer(
                             gradient_descent.GradientDescentOptimizer(args.learning_rate))
-      train_op = opt.minimize(total_loss)
+  train_op = opt.minimize(total_loss)
         
   return embedding_output,embedding_table,attention_mask,sequence_output,train_op
 
