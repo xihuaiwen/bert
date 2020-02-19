@@ -142,7 +142,7 @@ def bert_model(input_ids,input_mask,token_type_ids,
     # the GPU/CPU but may not be free on the TPU, so we want to minimize them to
                               # help the optimizer.
     prev_output = modeling.reshape_to_matrix(embedding_output)
-    embedding_output = tf.stop_gradient(embedding_output)
+    #embedding_output = tf.stop_gradient(embedding_output)
 
   for layer_idx in range(args.num_hidden_layers):
     """
@@ -223,11 +223,13 @@ def bert_model(input_ids,input_mask,token_type_ids,
       # We "pool" the model by simply taking the hidden state corresponding
       # to the first token. We assume that this has been pre-trained
           first_token_tensor = tf.squeeze(sequence_output[:, 0:1, :], axis=1)
-          pooled_output = tf.stop_gradient (tf.layers.dense(
+         # pooled_output = tf.stop_gradient (tf.layers.dense(
+          pooled_output = tf.layers.dense(
               first_token_tensor,
               args.hidden_size,
               activation=tf.tanh,
-              kernel_initializer=modeling.create_initializer(args.initializer_range)))
+          #    kernel_initializer=modeling.create_initializer(args.initializer_range)))
+              kernel_initializer=modeling.create_initializer(args.initializer_range))
 
       ### caculate the loss
       (next_sentence_loss, next_sentence_example_loss, next_sentence_log_probs) = get_next_sentence_output(
@@ -239,7 +241,7 @@ def bert_model(input_ids,input_mask,token_type_ids,
                             gradient_descent.GradientDescentOptimizer(args.learning_rate))
   train_op = opt.minimize(total_loss)
         
-  return embedding_output,embedding_table,attention_mask,sequence_output,train_op
+  return total_loss,train_op
 
 def get_masked_lm_output(input_tensor, output_weights, positions,
                          label_ids, label_weights):
@@ -265,8 +267,8 @@ def get_masked_lm_output(input_tensor, output_weights, positions,
         dtype=tf.float16,
         shape=[args.vocab_size],
         initializer=tf.zeros_initializer())
-    input_tensor = tf.stop_gradient(input_tensor)
-    output_weights = tf.stop_gradient(output_weights)
+    #input_tensor = tf.stop_gradient(input_tensor)
+    #output_weights = tf.stop_gradient(output_weights)
     logits = tf.matmul(input_tensor, output_weights, transpose_b=True)
     logits = tf.nn.bias_add(logits, output_bias)
     log_probs = tf.nn.log_softmax(logits, axis=-1)
@@ -349,9 +351,9 @@ with ipu_scope("/device:IPU:0"):
 
 
 opts = utils.create_ipu_config(profiling=args.profiling,profile_execution=args.profiling,use_poplar_text_report=args.poplar_text_report)
-opts = utils.set_convolution_options(opts, {"availableMemoryProportion": "0.23"})
+opts = utils.set_convolution_options(opts, {"availableMemoryProportion": "0,23"})
 opts = utils.set_matmul_options(opts,{"availableMemoryProportion": "0.23"})
-utils.set_recomputation_options(opts, allow_recompute=False)
+utils.set_recomputation_options(opts, allow_recompute=True)
 cfg = utils.auto_select_ipus(opts,calculate_required_ipu())
 ipu.utils.configure_ipu_system(cfg)
 
@@ -380,7 +382,7 @@ with tf.Session() as sess:
             _masked_lm_ids,
             _masked_lm_weights,
             _next_sentence_labels)  in data:
-            embedding_output,embedding_table,attention_mask,sequence_output = sess.run(batch,feed_dict = {input_ids:_input_ids,
+            total_loss = sess.run(batch,feed_dict = {input_ids:_input_ids,
                                             input_mask:_input_mask,
                                             token_type_ids:_token_type_ids,
                                             masked_lm_positions:_masked_lm_positions,
@@ -389,10 +391,7 @@ with tf.Session() as sess:
                                             next_sentence_labels:_next_sentence_labels})
             print ("processing #%d" % (j))
             j+=1
-            print (embedding_output.shape)
-            print (embedding_table.shape)
-            print (attention_mask.shape)
-            print (sequence_output.shape)
+            print (total_loss)
     raw_reports = sess.run(report)
     if args.poplar_text_report:
         rep = ipu.utils.extract_all_strings_from_event_trace(raw_reports)
