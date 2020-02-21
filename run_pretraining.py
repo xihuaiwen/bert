@@ -19,9 +19,19 @@ from __future__ import division
 from __future__ import print_function
 
 import os
+import sys
 import modeling
 import optimization
 import tensorflow as tf
+import math
+import pdb
+
+from tensorflow.python.ipu.scopes import ipu_scope
+from tensorflow.python.ipu import utils, scopes
+from tensorflow.python import ipu
+
+from tensorflow.python.ipu.optimizers import sharded_optimizer
+from tensorflow.python.training import gradient_descent
 
 flags = tf.flags
 
@@ -61,9 +71,9 @@ flags.DEFINE_bool("do_train", False, "Whether to run training.")
 
 flags.DEFINE_bool("do_eval", False, "Whether to run eval on the dev set.")
 
-flags.DEFINE_integer("train_batch_size", 32, "Total batch size for training.")
+flags.DEFINE_integer("train_batch_size", 1, "Total batch size for training.")
 
-flags.DEFINE_integer("eval_batch_size", 8, "Total batch size for eval.")
+flags.DEFINE_integer("eval_batch_size", 1, "Total batch size for eval.")
 
 flags.DEFINE_float("learning_rate", 5e-5, "The initial learning rate for Adam.")
 
@@ -78,6 +88,16 @@ flags.DEFINE_integer("iterations_per_loop", 1000,
                      "How many steps to make in each estimator call.")
 
 flags.DEFINE_integer("max_eval_steps", 100, "Maximum number of eval steps.")
+
+flags.DEFINE_bool("use_ipu", False, "Whether to user Graphcore IPU.")
+
+flags.DEFINE_integer("layers_per_ipu", 2 , "attention layers per IPU")
+
+flags.DEFINE_bool("ipu_profile", False, "Whether to enable Graphcore IPU event tracing/profiling.")
+
+flags.DEFINE_integer("ipu_log_interval", 100, "Interval at which to log progress.")
+
+flags.DEFINE_integer("ipu_summary_interval", 1, "Interval at which to write summaries.")
 
 flags.DEFINE_bool("use_tpu", False, "Whether to use TPU or GPU/CPU.")
 
@@ -105,6 +125,248 @@ flags.DEFINE_integer(
     "num_tpu_cores", 8,
     "Only used if `use_tpu` is True. Total number of TPU cores to use.")
 
+def calculate_required_ipus(num_hidden_layers):
+    num_shards = int (math.ceil(num_hidden_layers/2.0)) + 2
+    i = 0
+    num_ipus_list = [2,4,8,16]
+    for nums in num_ipus_list:
+        if nums >= num_shards:
+            return nums
+    print ("Cannot meet the IPU resource allocation request, you required %d" % (num_shards))
+    sys.exit(1)
+
+def create_estimator(FLAGS, model_fn, bert_config):
+    if FLAGS.use_ipu: 
+        return create_ipu_estimator(FLAGS, model_fn, bert_config)
+    else:
+        return create_tpu_estimator(FLAGS, model_fn,)
+
+def create_tpu_estimator(FLAGS,model_fn):
+    tpu_cluster_resolver = None
+    if FLAGS.use_tpu and FLAGS.tpu_name:
+        tpu_cluster_resolver = tf.distribute.cluster_resolver.TPUClusterResolver(
+          FLAGS.tpu_name, zone=FLAGS.tpu_zone, project=FLAGS.gcp_project)
+
+    is_per_host = tf.compat.v1.estimator.tpu.InputPipelineConfig.PER_HOST_V2
+    run_config = tf.compat.v1.estimator.tpu.RunConfig(
+        cluster=tpu_cluster_resolver,
+        master=FLAGS.master,
+        model_dir=FLAGS.output_dir,
+        save_checkpoints_steps=FLAGS.save_checkpoints_steps,
+        tpu_config=tf.compat.v1.estimator.tpu.TPUConfig(
+        iterations_per_loop=FLAGS.iterations_per_loop,
+        num_shards=FLAGS.num_tpu_cores,
+        per_host_input_for_training=is_per_host))
+    return tf.compat.v1.estimator.tpu.TPUEstimator(
+      use_tpu=FLAGS.use_tpu,
+      model_fn=model_fn,
+      config=run_config,
+      train_batch_size=FLAGS.train_batch_size,
+      eval_batch_size=FLAGS.eval_batch_size)
+
+def create_ipu_estimator(FLAGS, model_fn, bert_config):
+    ipu_options = ipu.utils.create_ipu_config(
+        profiling=FLAGS.ipu_profile,
+        use_poplar_text_report=FLAGS.ipu_profile,
+        profile_execution=FLAGS.ipu_profile
+    )
+
+    required_ipus = calculate_required_ipus(bert_config.num_hidden_layers)
+
+    ipu_options = ipu.utils.set_convolution_options(ipu_options, {"availableMemoryProportion": "0,23"})
+    ipu_options = ipu.utils.set_matmul_options(ipu_options,{"availableMemoryProportion": "0.23"})
+    ipu.utils.set_recomputation_options(ipu_options, allow_recompute=True)
+    
+    cfg = ipu.utils.auto_select_ipus(ipu_options, num_ipus=required_ipus)
+
+    ipu_run_config = ipu.ipu_run_config.IPURunConfig(
+        iterations_per_loop=FLAGS.iterations_per_loop,
+        ipu_options=ipu_options,
+        num_shards=required_ipus,
+    )
+
+    config = ipu.ipu_run_config.RunConfig(
+        ipu_run_config=ipu_run_config,
+        log_step_count_steps=FLAGS.ipu_log_interval,
+        save_summary_steps=FLAGS.ipu_summary_interval,
+        model_dir=FLAGS.output_dir,
+    )
+
+    return ipu.ipu_estimator.IPUEstimator(
+        config=config,
+        model_fn=model_fn,
+        params={"learning_rate": FLAGS.learning_rate,
+                "batch_size":FLAGS.train_batch_size},
+    )
+
+def model_fn_builder_ipu(bert_config, init_checkpoint, learning_rate,
+                     num_train_steps, num_warmup_steps):
+  """Returns `model_fn` closure for IPUEstimator."""
+  def model_fn(features, labels, mode, params):  # pylint: disable=unused-argument
+    """The `model_fn` for TPUEstimator."""
+    tf.logging.info("*** Features ***")
+    for name in sorted(features.keys()):
+      tf.logging.info("  name = %s, shape = %s" % (name, features[name].shape))
+
+    input_ids = features["input_ids"]
+    input_mask = features["input_mask"]
+    segment_ids = features["segment_ids"]
+    masked_lm_positions = features["masked_lm_positions"]
+    masked_lm_ids = features["masked_lm_ids"]
+    masked_lm_weights = features["masked_lm_weights"]
+    next_sentence_labels = features["next_sentence_labels"]
+
+    with scopes.ipu_shard(0):
+      embedding_output,embedding_table = modeling.embedding_lookup(
+                                         input_ids = input_ids,
+                                         vocab_size = bert_config.vocab_size,
+                                         embedding_size = bert_config.hidden_size,
+                                         initializer_range = bert_config.initializer_range,
+                                         word_embedding_name = "word_embeddings",
+                                         use_one_hot_embeddings = False
+                                         )
+    with scopes.ipu_shard(1):
+      embedding_output = modeling.embedding_postprocessor(
+                         input_tensor = embedding_output,
+                         use_token_type=True,
+                         token_type_ids=segment_ids, 
+                         token_type_vocab_size=2,
+                         token_type_embedding_name="token_type_embeddings",
+                         use_position_embeddings=True,
+                         position_embedding_name="position_embeddings",
+                         initializer_range=bert_config.initializer_range,
+                         max_position_embeddings=512,
+                         dropout_prob=bert_config.hidden_dropout_prob)
+
+      attention_mask = modeling.create_attention_mask_from_input_mask(
+                            input_ids, input_mask)
+
+      if bert_config.hidden_size % bert_config.num_attention_heads != 0:
+            raise ValueError(
+                            "The hidden size (%d) is not a multiple of the number of attention "
+                                    "heads (%d)" % (hidden_size, num_attention_heads))
+    
+      attention_head_size = int(bert_config.hidden_size /bert_config.num_attention_heads)
+      input_shape = modeling.get_shape_list(embedding_output, expected_rank=3)
+      batch_size = input_shape[0]
+      seq_length = input_shape[1]
+      input_width = input_shape[2]
+
+      # The Transformer performs sum residuals on all layers so the input needs
+      # to be the same as the hidden size.
+      if input_width != bert_config.hidden_size:
+        raise ValueError("The width of the input tensor (%d) != hidden size (%d)" %
+        (input_width, bert_config.hidden_size))
+
+      # We keep the representation as a 2D tensor to avoid re-shaping it back and
+      # forth from a 3D tensor to a 2D tensor. Re-shapes are normally free on
+      # the GPU/CPU but may not be free on the TPU, so we want to minimize them to
+                              # help the optimizer.
+      prev_output = modeling.reshape_to_matrix(embedding_output)
+      #embedding_output = tf.stop_gradient(embedding_output)
+
+    for layer_idx in range(bert_config.num_hidden_layers):
+      #  currently put one attention layer onto one IPU
+      #  embedding on IPU subgraph #0
+      #  loss caculation on IPU subgraph #1
+
+      with scopes.ipu_shard(int(math.floor(layer_idx/2.0)) + 2):
+        with tf.variable_scope("layer_%d" % layer_idx):
+          layer_input = prev_output
+  
+          with tf.variable_scope("attention"):
+            attention_heads = []
+            with tf.variable_scope("self"):
+              attention_head = modeling.attention_layer(
+                from_tensor=layer_input,
+                to_tensor=layer_input,
+                attention_mask=attention_mask,
+                num_attention_heads=bert_config.num_attention_heads,
+                size_per_head=attention_head_size,
+                attention_probs_dropout_prob=bert_config.attention_probs_dropout_prob,
+                initializer_range=bert_config.initializer_range,
+                do_return_2d_tensor=True,
+                batch_size=batch_size,
+                from_seq_length=seq_length,
+                to_seq_length=seq_length)
+              attention_heads.append(attention_head)
+  
+            attention_output = None
+            if len(attention_heads) == 1:
+              attention_output = attention_heads[0]
+            else:
+              # In the case where we have other sequences, we just concatenate
+              # them to the self-attention head before the projection.
+              attention_output = tf.concat(attention_heads, axis=-1)
+  
+              # Run a linear projection of `hidden_size` then add a residual
+              # with `layer_input`.
+            with tf.variable_scope("output"):
+              attention_output = tf.layers.dense(
+                attention_output,
+                bert_config.hidden_size,
+                kernel_initializer=modeling.create_initializer(bert_config.initializer_range))
+              attention_output = modeling.dropout(attention_output, bert_config.hidden_dropout_prob)
+              attention_output = modeling.layer_norm(attention_output + layer_input)
+  
+          # The activation is only applied to the "intermediate" hidden layer.
+          with tf.variable_scope("intermediate"):
+            intermediate_output = tf.layers.dense(
+              attention_output,
+              bert_config.intermediate_size,
+              activation=modeling.gelu,
+              kernel_initializer=modeling.create_initializer(bert_config.initializer_range))
+          # Down-project back to `hidden_size` then add the residual.
+          with tf.variable_scope("output"):
+            layer_output = tf.layers.dense(
+              intermediate_output,
+              bert_config.hidden_size,
+              kernel_initializer=modeling.create_initializer(bert_config.initializer_range))
+            layer_output = modeling.dropout(layer_output, bert_config.hidden_dropout_prob)
+            layer_output = modeling.layer_norm(layer_output + attention_output)
+            prev_output = layer_output
+	
+        if layer_idx == bert_config.num_hidden_layers - 1:
+          final_output = modeling.reshape_from_matrix(prev_output, input_shape)
+          #since in modeling.py the transformer_model return all layer output 
+          # we can comment following line 
+          #sequence_output = final_output[-1]
+          sequence_output = final_output
+
+    with scopes.ipu_shard(0):
+      (masked_lm_loss, masked_lm_example_loss, masked_lm_log_probs) = get_masked_lm_output(
+          bert_config,sequence_output, embedding_table,
+          masked_lm_positions, masked_lm_ids, masked_lm_weights)
+
+    with scopes.ipu_shard(1):
+      with tf.variable_scope("pooler"):
+      # We "pool" the model by simply taking the hidden state corresponding
+      # to the first token. We assume that this has been pre-trained
+          first_token_tensor = tf.squeeze(sequence_output[:, 0:1, :], axis=1)
+         # pooled_output = tf.stop_gradient (tf.layers.dense(
+          pooled_output = tf.layers.dense(
+              first_token_tensor,
+              bert_config.hidden_size,
+              activation=tf.tanh,
+          #    kernel_initializer=modeling.create_initializer(args.initializer_range)))
+              kernel_initializer=modeling.create_initializer(bert_config.initializer_range))
+
+      ### caculate the loss
+      (next_sentence_loss, next_sentence_example_loss, next_sentence_log_probs) = get_next_sentence_output(
+          bert_config,pooled_output, next_sentence_labels)
+
+      total_loss = masked_lm_loss + next_sentence_loss
+
+    opt = sharded_optimizer.ShardedOptimizer(
+                            gradient_descent.GradientDescentOptimizer(learning_rate))
+    train_op = opt.minimize(total_loss)
+        
+    output_spec = tf.estimator.EstimatorSpec(
+          mode=mode,
+          loss=total_loss,
+          train_op=train_op)
+    return output_spec
+  return model_fn
 
 def model_fn_builder(bert_config, init_checkpoint, learning_rate,
                      num_train_steps, num_warmup_steps, use_tpu,
@@ -258,6 +520,7 @@ def get_masked_lm_output(bert_config, input_tensor, output_weights, positions,
     # an output-only bias for each token.
     output_bias = tf.get_variable(
         "output_bias",
+        dtype=tf.float16,
         shape=[bert_config.vocab_size],
         initializer=tf.zeros_initializer())
     logits = tf.matmul(input_tensor, output_weights, transpose_b=True)
@@ -266,9 +529,10 @@ def get_masked_lm_output(bert_config, input_tensor, output_weights, positions,
 
     label_ids = tf.reshape(label_ids, [-1])
     label_weights = tf.reshape(label_weights, [-1])
+    label_weights = tf.cast(label_weights,dtype=tf.float16)
 
     one_hot_labels = tf.one_hot(
-        label_ids, depth=bert_config.vocab_size, dtype=tf.float32)
+        label_ids, depth=bert_config.vocab_size, dtype=tf.float16)
 
     # The `positions` tensor might be zero-padded (if the sequence is too
     # short to have the maximum number of predictions). The `label_weights`
@@ -290,16 +554,20 @@ def get_next_sentence_output(bert_config, input_tensor, labels):
   with tf.variable_scope("cls/seq_relationship"):
     output_weights = tf.get_variable(
         "output_weights",
+        dtype=tf.float16,
         shape=[2, bert_config.hidden_size],
         initializer=modeling.create_initializer(bert_config.initializer_range))
     output_bias = tf.get_variable(
-        "output_bias", shape=[2], initializer=tf.zeros_initializer())
+        "output_bias", 
+        dtype=tf.float16,
+        shape=[2], 
+        initializer=tf.zeros_initializer())
 
     logits = tf.matmul(input_tensor, output_weights, transpose_b=True)
     logits = tf.nn.bias_add(logits, output_bias)
     log_probs = tf.nn.log_softmax(logits, axis=-1)
     labels = tf.reshape(labels, [-1])
-    one_hot_labels = tf.one_hot(labels, depth=2, dtype=tf.float32)
+    one_hot_labels = tf.one_hot(labels, depth=2, dtype=tf.float16)
     per_example_loss = -tf.reduce_sum(one_hot_labels * log_probs, axis=-1)
     loss = tf.reduce_mean(per_example_loss)
     return (loss, per_example_loss, log_probs)
@@ -421,23 +689,15 @@ def main(_):
   for input_file in input_files:
     tf.logging.info("  %s" % input_file)
 
-  tpu_cluster_resolver = None
-  if FLAGS.use_tpu and FLAGS.tpu_name:
-    tpu_cluster_resolver = tf.contrib.cluster_resolver.TPUClusterResolver(
-        FLAGS.tpu_name, zone=FLAGS.tpu_zone, project=FLAGS.gcp_project)
-
-  is_per_host = tf.contrib.tpu.InputPipelineConfig.PER_HOST_V2
-  run_config = tf.contrib.tpu.RunConfig(
-      cluster=tpu_cluster_resolver,
-      master=FLAGS.master,
-      model_dir=FLAGS.output_dir,
-      save_checkpoints_steps=FLAGS.save_checkpoints_steps,
-      tpu_config=tf.contrib.tpu.TPUConfig(
-          iterations_per_loop=FLAGS.iterations_per_loop,
-          num_shards=FLAGS.num_tpu_cores,
-          per_host_input_for_training=is_per_host))
-
-  model_fn = model_fn_builder(
+  if FLAGS.use_ipu:
+    model_fn = model_fn_builder_ipu(
+      bert_config=bert_config,
+      init_checkpoint=FLAGS.init_checkpoint,
+      learning_rate=FLAGS.learning_rate,
+      num_train_steps=FLAGS.num_train_steps,
+      num_warmup_steps=FLAGS.num_warmup_steps)
+  else:
+    model_fn = model_fn_builder(
       bert_config=bert_config,
       init_checkpoint=FLAGS.init_checkpoint,
       learning_rate=FLAGS.learning_rate,
@@ -446,14 +706,7 @@ def main(_):
       use_tpu=FLAGS.use_tpu,
       use_one_hot_embeddings=FLAGS.use_tpu)
 
-  # If TPU is not available, this will fall back to normal Estimator on CPU
-  # or GPU.
-  estimator = tf.contrib.tpu.TPUEstimator(
-      use_tpu=FLAGS.use_tpu,
-      model_fn=model_fn,
-      config=run_config,
-      train_batch_size=FLAGS.train_batch_size,
-      eval_batch_size=FLAGS.eval_batch_size)
+  estimator = create_estimator(FLAGS,model_fn,bert_config)
 
   if FLAGS.do_train:
     tf.logging.info("***** Running training *****")
