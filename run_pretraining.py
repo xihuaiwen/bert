@@ -32,6 +32,8 @@ from tensorflow.python import ipu
 
 from tensorflow.python.ipu.optimizers import sharded_optimizer
 from tensorflow.python.training import gradient_descent
+from tensorflow.python.ipu.ipu_pipeline_estimator import IPUPipelineEstimatorSpec, IPUPipelineEstimator
+from tensorflow.python.ipu.ops import pipelining_ops
 
 flags = tf.flags
 
@@ -77,7 +79,7 @@ flags.DEFINE_integer("eval_batch_size", 1, "Total batch size for eval.")
 
 flags.DEFINE_float("learning_rate", 5e-5, "The initial learning rate for Adam.")
 
-flags.DEFINE_integer("num_train_steps", 100000, "Number of training steps.")
+flags.DEFINE_integer("num_train_steps", 1000000, "Number of training steps.")
 
 flags.DEFINE_integer("num_warmup_steps", 10000, "Number of warmup steps.")
 
@@ -126,7 +128,7 @@ flags.DEFINE_integer(
     "Only used if `use_tpu` is True. Total number of TPU cores to use.")
 
 def calculate_required_ipus(num_hidden_layers):
-    num_shards = int (math.ceil(num_hidden_layers/2.0)) + 2
+    num_shards = num_hidden_layers + 2
     i = 0
     num_ipus_list = [2,4,8,16]
     for nums in num_ipus_list:
@@ -192,7 +194,7 @@ def create_ipu_estimator(FLAGS, model_fn, bert_config):
         model_dir=FLAGS.output_dir,
     )
 
-    return ipu.ipu_estimator.IPUEstimator(
+    return IPUPipelineEstimator(
         config=config,
         model_fn=model_fn,
         params={"learning_rate": FLAGS.learning_rate,
@@ -202,21 +204,10 @@ def create_ipu_estimator(FLAGS, model_fn, bert_config):
 def model_fn_builder_ipu(bert_config, init_checkpoint, learning_rate,
                      num_train_steps, num_warmup_steps):
   """Returns `model_fn` closure for IPUEstimator."""
-  def model_fn(features, labels, mode, params):  # pylint: disable=unused-argument
-    """The `model_fn` for TPUEstimator."""
-    tf.logging.info("*** Features ***")
-    for name in sorted(features.keys()):
-      tf.logging.info("  name = %s, shape = %s" % (name, features[name].shape))
-
-    input_ids = features["input_ids"]
-    input_mask = features["input_mask"]
-    segment_ids = features["segment_ids"]
-    masked_lm_positions = features["masked_lm_positions"]
-    masked_lm_ids = features["masked_lm_ids"]
-    masked_lm_weights = features["masked_lm_weights"]
-    next_sentence_labels = features["next_sentence_labels"]
-
-    with scopes.ipu_shard(0):
+  def model_fn(mode, params):
+    def words_embedding_lookup(input_ids,input_mask,segment_ids,
+            masked_lm_positions,masked_lm_ids,
+            masked_lm_weights,next_sentence_labels):
       embedding_output,embedding_table = modeling.embedding_lookup(
                                          input_ids = input_ids,
                                          vocab_size = bert_config.vocab_size,
@@ -225,7 +216,9 @@ def model_fn_builder_ipu(bert_config, init_checkpoint, learning_rate,
                                          word_embedding_name = "word_embeddings",
                                          use_one_hot_embeddings = False
                                          )
-    with scopes.ipu_shard(1):
+      return embedding_output,embedding_table,input_ids,input_mask,segment_ids,masked_lm_positions,masked_lm_ids,masked_lm_weights,next_sentence_labels
+    
+    def positional_segment_embedding_lookup(embedding_output,embedding_table,input_ids,input_mask,segment_ids,masked_lm_positions,masked_lm_ids,masked_lm_weights,next_sentence_labels):
       embedding_output = modeling.embedding_postprocessor(
                          input_tensor = embedding_output,
                          use_token_type=True,
@@ -256,28 +249,24 @@ def model_fn_builder_ipu(bert_config, init_checkpoint, learning_rate,
       # to be the same as the hidden size.
       if input_width != bert_config.hidden_size:
         raise ValueError("The width of the input tensor (%d) != hidden size (%d)" %
-        (input_width, bert_config.hidden_size))
+          (input_width, bert_config.hidden_size))
 
       # We keep the representation as a 2D tensor to avoid re-shaping it back and
       # forth from a 3D tensor to a 2D tensor. Re-shapes are normally free on
       # the GPU/CPU but may not be free on the TPU, so we want to minimize them to
                               # help the optimizer.
       prev_output = modeling.reshape_to_matrix(embedding_output)
-      #embedding_output = tf.stop_gradient(embedding_output)
+      return prev_output,attention_mask,embedding_table,embedding_output,masked_lm_positions,masked_lm_ids,masked_lm_weights,next_sentence_labels
 
-    for layer_idx in range(bert_config.num_hidden_layers):
-      #  currently put one attention layer onto one IPU
-      #  embedding on IPU subgraph #0
-      #  loss caculation on IPU subgraph #1
-
-      with scopes.ipu_shard(int(math.floor(layer_idx/2.0)) + 2):
-        with tf.variable_scope("layer_%d" % layer_idx):
-          layer_input = prev_output
+    def attention_ff(prev_output,attention_mask,embedding_table,embedding_output,masked_lm_positions,masked_lm_ids,masked_lm_weights,next_sentence_labels):
+        layer_input = prev_output
   
-          with tf.variable_scope("attention"):
-            attention_heads = []
-            with tf.variable_scope("self"):
-              attention_head = modeling.attention_layer(
+        attention_head_size = int(bert_config.hidden_size /bert_config.num_attention_heads)
+        input_shape = modeling.get_shape_list(embedding_output, expected_rank=3)
+        with tf.variable_scope("attention"):
+          attention_heads = []
+          with tf.variable_scope("self"):
+            attention_head = modeling.attention_layer(
                 from_tensor=layer_input,
                 to_tensor=layer_input,
                 attention_mask=attention_mask,
@@ -286,59 +275,61 @@ def model_fn_builder_ipu(bert_config, init_checkpoint, learning_rate,
                 attention_probs_dropout_prob=bert_config.attention_probs_dropout_prob,
                 initializer_range=bert_config.initializer_range,
                 do_return_2d_tensor=True,
-                batch_size=batch_size,
-                from_seq_length=seq_length,
-                to_seq_length=seq_length)
-              attention_heads.append(attention_head)
+                batch_size=FLAGS.train_batch_size,
+                from_seq_length=FLAGS.max_seq_length,
+                to_seq_length=FLAGS.max_seq_length)
+            attention_heads.append(attention_head)
   
-            attention_output = None
-            if len(attention_heads) == 1:
-              attention_output = attention_heads[0]
-            else:
-              # In the case where we have other sequences, we just concatenate
-              # them to the self-attention head before the projection.
-              attention_output = tf.concat(attention_heads, axis=-1)
+          attention_output = None
+          if len(attention_heads) == 1:
+            attention_output = attention_heads[0]
+          else:
+            # In the case where we have other sequences, we just concatenate
+            # them to the self-attention head before the projection.
+            attention_output = tf.concat(attention_heads, axis=-1)
   
-              # Run a linear projection of `hidden_size` then add a residual
-              # with `layer_input`.
-            with tf.variable_scope("output"):
-              attention_output = tf.layers.dense(
+          # Run a linear projection of `hidden_size` then add a residual
+          # with `layer_input`.
+          with tf.variable_scope("output"):
+            attention_output = tf.layers.dense(
                 attention_output,
                 bert_config.hidden_size,
                 kernel_initializer=modeling.create_initializer(bert_config.initializer_range))
-              attention_output = modeling.dropout(attention_output, bert_config.hidden_dropout_prob)
-              attention_output = modeling.layer_norm(attention_output + layer_input)
+            attention_output = modeling.dropout(attention_output, bert_config.hidden_dropout_prob)
+            attention_output = modeling.layer_norm(attention_output + layer_input)
   
-          # The activation is only applied to the "intermediate" hidden layer.
-          with tf.variable_scope("intermediate"):
-            intermediate_output = tf.layers.dense(
+        # The activation is only applied to the "intermediate" hidden layer.
+        with tf.variable_scope("intermediate"):
+          intermediate_output = tf.layers.dense(
               attention_output,
               bert_config.intermediate_size,
               activation=modeling.gelu,
               kernel_initializer=modeling.create_initializer(bert_config.initializer_range))
-          # Down-project back to `hidden_size` then add the residual.
-          with tf.variable_scope("output"):
-            layer_output = tf.layers.dense(
+        # Down-project back to `hidden_size` then add the residual.
+        with tf.variable_scope("output"):
+          layer_output = tf.layers.dense(
               intermediate_output,
               bert_config.hidden_size,
               kernel_initializer=modeling.create_initializer(bert_config.initializer_range))
-            layer_output = modeling.dropout(layer_output, bert_config.hidden_dropout_prob)
-            layer_output = modeling.layer_norm(layer_output + attention_output)
-            prev_output = layer_output
+          layer_output = modeling.dropout(layer_output, bert_config.hidden_dropout_prob)
+          layer_output = modeling.layer_norm(layer_output + attention_output)
+          prev_output = layer_output
 	
-        if layer_idx == bert_config.num_hidden_layers - 1:
-          final_output = modeling.reshape_from_matrix(prev_output, input_shape)
+        #if layer_idx == args.num_hidden_layers - 1:
+        final_output = modeling.reshape_from_matrix(prev_output, input_shape)
           #since in modeling.py the transformer_model return all layer output 
           # we can comment following line 
           #sequence_output = final_output[-1]
-          sequence_output = final_output
+        sequence_output = final_output
+        return sequence_output,embedding_table,masked_lm_positions,masked_lm_ids,masked_lm_weights,next_sentence_labels
 
-    with scopes.ipu_shard(0):
+    def mlm_loss_calc(sequence_output,embedding_table,masked_lm_positions,masked_lm_ids,masked_lm_weights,next_sentence_labels):
       (masked_lm_loss, masked_lm_example_loss, masked_lm_log_probs) = get_masked_lm_output(
           bert_config,sequence_output, embedding_table,
           masked_lm_positions, masked_lm_ids, masked_lm_weights)
+      return masked_lm_loss,sequence_output,next_sentence_labels
 
-    with scopes.ipu_shard(1):
+    def nsp_loss_calc(masked_lm_loss,sequence_output,next_sentence_labels):
       with tf.variable_scope("pooler"):
       # We "pool" the model by simply taking the hidden state corresponding
       # to the first token. We assume that this has been pre-trained
@@ -356,18 +347,19 @@ def model_fn_builder_ipu(bert_config, init_checkpoint, learning_rate,
           bert_config,pooled_output, next_sentence_labels)
 
       total_loss = masked_lm_loss + next_sentence_loss
-
-    opt = sharded_optimizer.ShardedOptimizer(
-                            gradient_descent.GradientDescentOptimizer(learning_rate))
-    train_op = opt.minimize(total_loss)
-        
-    output_spec = tf.estimator.EstimatorSpec(
-          mode=mode,
-          loss=total_loss,
-          train_op=train_op)
-    return output_spec
+      return total_loss
+    
+    def optimizer_function(total_loss):
+        opt = gradient_descent.GradientDescentOptimizer(FLAGS.learning_rate)
+        return pipelining_ops.OptimizerFunctionOutput(opt, total_loss)   
+  
+    return IPUPipelineEstimatorSpec(tf.estimator.ModeKeys.TRAIN,
+                                computational_stages=[words_embedding_lookup, positional_segment_embedding_lookup,attention_ff,mlm_loss_calc,nsp_loss_calc],
+                                pipeline_depth=4,
+                                optimizer_function=optimizer_function,
+                                device_mapping=[0,1,2,3,4]
+                                )
   return model_fn
-
 def model_fn_builder(bert_config, init_checkpoint, learning_rate,
                      num_train_steps, num_warmup_steps, use_tpu,
                      use_one_hot_embeddings):

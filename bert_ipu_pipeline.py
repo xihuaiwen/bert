@@ -1,21 +1,23 @@
-import numpy as np
 import math
+import numpy as np
 import tensorflow as tf
-from tensorflow.python.ipu.scopes import ipu_scope
-from tensorflow.python.ipu import utils, scopes
-from tensorflow.python import ipu
-from tensorflow.python.ipu import loops
-import modeling
-import optimization
-from tensorflow.compiler.plugin.poplar.ops import gen_ipu_ops
-from gcprofile import save_tf_report
-from tensorflow.python.ipu.optimizers import sharded_optimizer
-from tensorflow.python.training import gradient_descent
+
 import tensorflow.contrib.slim as slim
+from tensorflow.python.training import gradient_descent
+
 from tensorflow.python.ipu import ipu_compiler
 from tensorflow.python.ipu import ipu_infeed_queue
 from tensorflow.python.ipu import ipu_outfeed_queue
+from tensorflow.python.ipu import pipelining_ops
+from tensorflow.python.ipu import utils, scopes
+from tensorflow.python.ipu import loops
+from tensorflow.python.ipu.optimizers import sharded_optimizer
+from tensorflow.python.ipu.scopes import ipu_scope
+from tensorflow.compiler.plugin.poplar.ops import gen_ipu_ops
+from gcprofile import save_tf_report
 
+import modeling
+import optimization
 import argparse
 
 parser = argparse.ArgumentParser(description='NMT model in TensorFlow to run on the IPU')
@@ -71,8 +73,7 @@ def generate_tf_dataset():
                                       _masked_lm_weights,
                                       _next_sentence_labels))
     ds = ds.repeat()
-    iterator = ds.make_initializable_iterator()
-    return ds,iterator
+    return ds
 
 def model_summary():
     model_vars = tf.trainable_variables()
@@ -99,32 +100,8 @@ def words_embedding_lookup(input_ids,input_mask,token_type_ids,
                                          word_embedding_name = "word_embeddings",
                                          use_one_hot_embeddings = False
                                          )
-def positional_segment_embedding_lookup():
-  pass
-def attention_ff():
-  pass
-def mlm_loss_calc():
-  pass
-def nsp_loss_calc():
-  pass
-
-ds,itr = generate_tf_dataset()
-infeed = ipu_infeed_queue.IPUInfeedQueue(ds,feed_name="infeed")
-outfeed = ipu_outfeed_queue.IPUOutfeedQueue(feed_name="outfeed")
-
-def bert_model(input_ids,input_mask,token_type_ids,
-            masked_lm_positions,masked_lm_ids,
-            masked_lm_weights,next_sentence_labels):
-  with scopes.ipu_shard(0):
-    embedding_output,embedding_table = modeling.embedding_lookup(
-                                         input_ids = input_ids,
-                                         vocab_size = args.vocab_size,
-                                         embedding_size = args.hidden_size,
-                                         initializer_range = args.initializer_range,
-                                         word_embedding_name = "word_embeddings",
-                                         use_one_hot_embeddings = False
-                                         )
-  with scopes.ipu_shard(1):
+    return embedding_output,embedding_table,input_ids,input_mask,token_type_ids,masked_lm_positions,masked_lm_ids,masked_lm_weights,next_sentence_labels
+def positional_segment_embedding_lookup(embedding_output,embedding_table,input_ids,input_mask,token_type_ids,masked_lm_positions,masked_lm_ids,masked_lm_weights,next_sentence_labels):
     embedding_output = modeling.embedding_postprocessor(
                          input_tensor = embedding_output,
                          use_token_type=True,
@@ -162,18 +139,13 @@ def bert_model(input_ids,input_mask,token_type_ids,
     # the GPU/CPU but may not be free on the TPU, so we want to minimize them to
                               # help the optimizer.
     prev_output = modeling.reshape_to_matrix(embedding_output)
-    #embedding_output = tf.stop_gradient(embedding_output)
+    return prev_output,attention_mask,embedding_table,embedding_output,masked_lm_positions,masked_lm_ids,masked_lm_weights,next_sentence_labels
 
-  for layer_idx in range(args.num_hidden_layers):
-    """
-        currently put one attention layer onto one IPU
-        embedding on IPU subgraph #0
-        loss caculation on IPU subgraph #1
-    """
-    with scopes.ipu_shard(int(layer_idx) + 2):
-      with tf.variable_scope("layer_%d" % layer_idx):
+def attention_ff(prev_output,attention_mask,embedding_table,embedding_output,masked_lm_positions,masked_lm_ids,masked_lm_weights,next_sentence_labels):
         layer_input = prev_output
   
+        attention_head_size = int(args.hidden_size /args.num_attention_heads)
+        input_shape = modeling.get_shape_list(embedding_output, expected_rank=3)
         with tf.variable_scope("attention"):
           attention_heads = []
           with tf.variable_scope("self"):
@@ -226,19 +198,21 @@ def bert_model(input_ids,input_mask,token_type_ids,
           layer_output = modeling.layer_norm(layer_output + attention_output)
           prev_output = layer_output
 	
-        if layer_idx == args.num_hidden_layers - 1:
-          final_output = modeling.reshape_from_matrix(prev_output, input_shape)
+        #if layer_idx == args.num_hidden_layers - 1:
+        final_output = modeling.reshape_from_matrix(prev_output, input_shape)
           #since in modeling.py the transformer_model return all layer output 
           # we can comment following line 
           #sequence_output = final_output[-1]
-          sequence_output = final_output
+        sequence_output = final_output
+        return sequence_output,embedding_table,masked_lm_positions,masked_lm_ids,masked_lm_weights,next_sentence_labels
 
-  with scopes.ipu_shard(0):
+def mlm_loss_calc(sequence_output,embedding_table,masked_lm_positions,masked_lm_ids,masked_lm_weights,next_sentence_labels):
       (masked_lm_loss, masked_lm_example_loss, masked_lm_log_probs) = get_masked_lm_output(
           sequence_output, embedding_table,
           masked_lm_positions, masked_lm_ids, masked_lm_weights)
+      return masked_lm_loss,sequence_output,next_sentence_labels
 
-  with scopes.ipu_shard(1):
+def nsp_loss_calc(masked_lm_loss,sequence_output,next_sentence_labels):
       with tf.variable_scope("pooler"):
       # We "pool" the model by simply taking the hidden state corresponding
       # to the first token. We assume that this has been pre-trained
@@ -256,12 +230,13 @@ def bert_model(input_ids,input_mask,token_type_ids,
           pooled_output, next_sentence_labels)
 
       total_loss = masked_lm_loss + next_sentence_loss
+      return total_loss
 
-  opt = sharded_optimizer.ShardedOptimizer(
-                            gradient_descent.GradientDescentOptimizer(args.learning_rate))
-  train_op = opt.minimize(total_loss)
-        
-  return outfeed.enqueue(total_loss),train_op
+def optimizer_function(total_loss):
+  opt = gradient_descent.GradientDescentOptimizer(args.learning_rate)
+  return pipelining_ops.OptimizerFunctionOutput(opt, total_loss)
+
+
 
 def get_masked_lm_output(input_tensor, output_weights, positions,
                          label_ids, label_weights):
@@ -352,40 +327,42 @@ def gather_indexes(sequence_tensor, positions):
   output_tensor = tf.gather(flat_sequence_tensor, flat_positions)
   return output_tensor
 
-def bert_loop():
-  return loops.repeat(100,bert_model,infeed_queue=infeed)
+ds = generate_tf_dataset()
+infeed = ipu_infeed_queue.IPUInfeedQueue(ds,feed_name="infeed")
+outfeed = ipu_outfeed_queue.IPUOutfeedQueue(feed_name="outfeed")
 
-with ipu_scope("/device:IPU:0"):
-    input_ids = tf.placeholder(tf.int32,shape=(args.batch_size, args.seq_length),name='input_ids')
-    input_mask = tf.placeholder(tf.int32,shape=(args.batch_size, args.seq_length),name='input_mask')
-    token_type_ids = tf.placeholder(tf.int32,shape=(args.batch_size, args.seq_length),name='token_type_ids')
+def my_pipeline_net():
+    return pipelining_ops.pipeline(
+        [words_embedding_lookup, positional_segment_embedding_lookup,attention_ff,mlm_loss_calc,nsp_loss_calc],
+        12,
+        inputs=[],
+        optimizer_function=optimizer_function,  
+    #    device_mapping=[0,1,2,3,4],
+        infeed_queue=infeed,
+        outfeed_queue=outfeed,
+        pipeline_schedule=pipelining_ops.PipelineSchedule.Interleaved)
 
-    masked_lm_positions = tf.placeholder(tf.int32,shape=(args.batch_size,args.max_predictions_per_seq),name="masked_lm_positions")
-    masked_lm_ids = tf.placeholder(tf.int32,shape=(args.batch_size,args.max_predictions_per_seq),name="masked_lm_ids")
-    masked_lm_weights = tf.placeholder(tf.float32,shape=(args.batch_size,args.max_predictions_per_seq),name="masked_lm_weights")
-    next_sentence_labels = tf.placeholder(tf.int32,shape=(1),name="next_sentence_labels")
-    batch = ipu.ipu_compiler.compile(bert_loop)
 
-
-_total_loss = outfeed.dequeue()
 opts = utils.create_ipu_config(profiling=args.profiling,profile_execution=args.profiling,use_poplar_text_report=args.poplar_text_report)
 opts = utils.set_convolution_options(opts, {"availableMemoryProportion": "0,23"})
 opts = utils.set_matmul_options(opts,{"availableMemoryProportion": "0.23"})
 utils.set_recomputation_options(opts, allow_recompute=True)
-cfg = utils.auto_select_ipus(opts,calculate_required_ipu())
-ipu.utils.configure_ipu_system(cfg)
+#cfg = utils.auto_select_ipus(opts,calculate_required_ipu())
+cfg = utils.auto_select_ipus(opts,8)
+utils.configure_ipu_system(cfg)
 
-tvars = tf.trainable_variables()
+with ipu_scope("/device:IPU:0"):
+    batch = ipu_compiler.compile(my_pipeline_net)
+    tvars = tf.trainable_variables()
 tf.logging.info("**** Trainable Variables ****")
 for var in tvars:
     init_string = ""
     tf.logging.info("  name = %s, shape = %s%s", var.name, var.shape,
                       init_string)
 
+outfeed_op = outfeed.dequeue()
 with tf.device('cpu'):
     report = gen_ipu_ops.ipu_event_trace()
-
-
 
 with tf.Session() as sess:
     model_summary()
@@ -393,7 +370,7 @@ with tf.Session() as sess:
     sess.run(infeed.initializer)
     for i in range(0,args.epochs):
         sess.run(batch)
-        result = sess.run(_total_loss)
+        result = sess.run(outfeed_op)
         print (result)
     raw_reports = sess.run(report)
     if args.poplar_text_report:
@@ -402,3 +379,4 @@ with tf.Session() as sess:
             f.write(rep)
     else:
         save_tf_report(raw_reports)
+
