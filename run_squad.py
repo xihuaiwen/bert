@@ -224,6 +224,30 @@ class InputFeatures(object):
     self.is_impossible = is_impossible
 
 
+def create_estimator(FLAGS, model_fn, bert_config):
+  tpu_cluster_resolver = None
+  if FLAGS.use_tpu and FLAGS.tpu_name:
+    tpu_cluster_resolver = tf.distribute.cluster_resolver.TPUClusterResolver(
+        FLAGS.tpu_name, zone=FLAGS.tpu_zone, project=FLAGS.gcp_project)
+
+  is_per_host = tf.compat.v1.estimator.tpu.InputPipelineConfig.PER_HOST_V2
+  run_config = tf.compat.v1.estimator.tpu.RunConfig(
+      cluster=tpu_cluster_resolver,
+      master=FLAGS.master,
+      model_dir=FLAGS.output_dir,
+      save_checkpoints_steps=FLAGS.save_checkpoints_steps,
+      tpu_config=tf.compat.v1.estimator.tpu.TPUConfig(
+      iterations_per_loop=FLAGS.iterations_per_loop,
+      num_shards=FLAGS.num_tpu_cores,
+      per_host_input_for_training=is_per_host))
+
+  return tf.compat.v1.estimator.tpu.TPUEstimator(
+      use_tpu=FLAGS.use_tpu,
+      model_fn=model_fn,
+      config=run_config,
+      train_batch_size=FLAGS.train_batch_size,
+      predict_batch_size=FLAGS.predict_batch_size)
+
 def read_squad_examples(input_file, is_training):
   """Read a SQuAD json file into a list of SquadExample."""
   with tf.gfile.Open(input_file, "r") as reader:
@@ -1135,22 +1159,6 @@ def main(_):
   tokenizer = tokenization.FullTokenizer(
       vocab_file=FLAGS.vocab_file, do_lower_case=FLAGS.do_lower_case)
 
-  tpu_cluster_resolver = None
-  if FLAGS.use_tpu and FLAGS.tpu_name:
-    tpu_cluster_resolver = tf.contrib.cluster_resolver.TPUClusterResolver(
-        FLAGS.tpu_name, zone=FLAGS.tpu_zone, project=FLAGS.gcp_project)
-
-  is_per_host = tf.contrib.tpu.InputPipelineConfig.PER_HOST_V2
-  run_config = tf.contrib.tpu.RunConfig(
-      cluster=tpu_cluster_resolver,
-      master=FLAGS.master,
-      model_dir=FLAGS.output_dir,
-      save_checkpoints_steps=FLAGS.save_checkpoints_steps,
-      tpu_config=tf.contrib.tpu.TPUConfig(
-          iterations_per_loop=FLAGS.iterations_per_loop,
-          num_shards=FLAGS.num_tpu_cores,
-          per_host_input_for_training=is_per_host))
-
   train_examples = None
   num_train_steps = None
   num_warmup_steps = None
@@ -1175,14 +1183,7 @@ def main(_):
       use_tpu=FLAGS.use_tpu,
       use_one_hot_embeddings=FLAGS.use_tpu)
 
-  # If TPU is not available, this will fall back to normal Estimator on CPU
-  # or GPU.
-  estimator = tf.contrib.tpu.TPUEstimator(
-      use_tpu=FLAGS.use_tpu,
-      model_fn=model_fn,
-      config=run_config,
-      train_batch_size=FLAGS.train_batch_size,
-      predict_batch_size=FLAGS.predict_batch_size)
+  estimator = create_estimator(FLAGS, model_fn, bert_config)
 
   if FLAGS.do_train:
     # We write to a temporary file to avoid storing very large constant tensors
