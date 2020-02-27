@@ -114,6 +114,8 @@ flags.DEFINE_integer(
     "The maximum length of an answer that can be generated. This is needed "
     "because the start and end predictions are not conditioned on one another.")
 
+flags.DEFINE_bool("use_fp16", False, "Whether to user half precision float to train.")
+
 flags.DEFINE_bool("use_tpu", False, "Whether to use TPU or GPU/CPU.")
 
 tf.flags.DEFINE_string(
@@ -591,10 +593,13 @@ def create_model(bert_config, is_training, input_ids, input_mask, segment_ids,
 
   output_weights = tf.get_variable(
       "cls/squad/output_weights", [2, hidden_size],
+      dtype = bert_config.dtype,
       initializer=tf.truncated_normal_initializer(stddev=0.02))
 
   output_bias = tf.get_variable(
-      "cls/squad/output_bias", [2], initializer=tf.zeros_initializer())
+      "cls/squad/output_bias", [2], 
+      dtype = bert_config.dtype,
+      initializer=tf.zeros_initializer())
 
   final_hidden_matrix = tf.reshape(final_hidden,
                                    [batch_size * seq_length, hidden_size])
@@ -669,7 +674,7 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
 
       def compute_loss(logits, positions):
         one_hot_positions = tf.one_hot(
-            positions, depth=seq_length, dtype=tf.float32)
+            positions, depth=seq_length, dtype=bert_config.dtype)
         log_probs = tf.nn.log_softmax(logits, axis=-1)
         loss = -tf.reduce_mean(
             tf.reduce_sum(one_hot_positions * log_probs, axis=-1))

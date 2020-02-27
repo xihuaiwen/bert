@@ -79,6 +79,8 @@ flags.DEFINE_integer("iterations_per_loop", 1000,
 
 flags.DEFINE_integer("max_eval_steps", 100, "Maximum number of eval steps.")
 
+flags.DEFINE_bool("use_fp16", False, "Whether to user half precision float to train.")
+
 flags.DEFINE_bool("use_tpu", False, "Whether to use TPU or GPU/CPU.")
 
 tf.flags.DEFINE_string(
@@ -130,7 +132,6 @@ def create_estimator(FLAGS, model_fn, bert_config):
       config=run_config,
       train_batch_size=FLAGS.train_batch_size,
       eval_batch_size=FLAGS.eval_batch_size)
-
 
 def model_fn_builder(bert_config, init_checkpoint, learning_rate,
                      num_train_steps, num_warmup_steps, use_tpu,
@@ -284,6 +285,7 @@ def get_masked_lm_output(bert_config, input_tensor, output_weights, positions,
     # an output-only bias for each token.
     output_bias = tf.get_variable(
         "output_bias",
+        dtype=bert_config.dtype,
         shape=[bert_config.vocab_size],
         initializer=tf.zeros_initializer())
     logits = tf.matmul(input_tensor, output_weights, transpose_b=True)
@@ -292,9 +294,10 @@ def get_masked_lm_output(bert_config, input_tensor, output_weights, positions,
 
     label_ids = tf.reshape(label_ids, [-1])
     label_weights = tf.reshape(label_weights, [-1])
-
+    if bert_config.dtype == tf.float16:
+      label_weights = tf.cast(label_weights,dtype=tf.float16)
     one_hot_labels = tf.one_hot(
-        label_ids, depth=bert_config.vocab_size, dtype=tf.float32)
+        label_ids, depth=bert_config.vocab_size, dtype=bert_config.dtype)
 
     # The `positions` tensor might be zero-padded (if the sequence is too
     # short to have the maximum number of predictions). The `label_weights`
@@ -316,16 +319,20 @@ def get_next_sentence_output(bert_config, input_tensor, labels):
   with tf.variable_scope("cls/seq_relationship"):
     output_weights = tf.get_variable(
         "output_weights",
+        dtype=bert_config.dtype,
         shape=[2, bert_config.hidden_size],
         initializer=modeling.create_initializer(bert_config.initializer_range))
     output_bias = tf.get_variable(
-        "output_bias", shape=[2], initializer=tf.zeros_initializer())
+        "output_bias",
+        dtype=bert_config.dtype,
+        shape=[2],
+        initializer=tf.zeros_initializer())
 
     logits = tf.matmul(input_tensor, output_weights, transpose_b=True)
     logits = tf.nn.bias_add(logits, output_bias)
     log_probs = tf.nn.log_softmax(logits, axis=-1)
     labels = tf.reshape(labels, [-1])
-    one_hot_labels = tf.one_hot(labels, depth=2, dtype=tf.float32)
+    one_hot_labels = tf.one_hot(labels, depth=2, dtype=bert_config.dtype)
     per_example_loss = -tf.reduce_sum(one_hot_labels * log_probs, axis=-1)
     loss = tf.reduce_mean(per_example_loss)
     return (loss, per_example_loss, log_probs)
