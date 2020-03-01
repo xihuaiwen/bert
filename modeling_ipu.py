@@ -26,6 +26,9 @@ import re
 import numpy as np
 import six
 import tensorflow as tf
+from tensorflow.python import ipu
+from tensorflow.python.ipu import utils, scopes
+from tensorflow.python.ipu.ops.embedding_ops import embedding_lookup as embedding_lookup_ipu
 
 
 class BertConfig(object):
@@ -43,7 +46,8 @@ class BertConfig(object):
                max_position_embeddings=512,
                type_vocab_size=16,
                initializer_range=0.02,
-               use_fp16=False):
+               use_fp16=False,
+               attention_layers_per_ipu=1):
     """Constructs BertConfig.
 
     Args:
@@ -83,6 +87,7 @@ class BertConfig(object):
       self.dtype = tf.float16
     else:
       self.dtype = tf.float32
+    self.attention_layers_per_ipu = 1
 
   @classmethod
   def from_dict(cls, json_object):
@@ -173,43 +178,56 @@ class BertModel(object):
     if token_type_ids is None:
       token_type_ids = tf.zeros(shape=[batch_size, seq_length], dtype=tf.int32)
 
+    #initial split bert model into multiple IPUs
+    #words embedding will be put on ipu_shard(0)
+    #positional/segment embedding will be put on ipu_shard(1)
+
+    embedding_shard_placement = { "words_embedding": 0,
+            "positional_segment_embedding": 1,
+            }
+    attention_shard_placement = [(int(math.ceil(i/config.attention_layers_per_ipu)) + 2) for i in range(0,config.num_hidden_layers)]
+
     with tf.variable_scope(scope, default_name="bert"):
       with tf.variable_scope("embeddings"):
         # Perform embedding lookup on the word ids.
-        (self.embedding_output, self.embedding_table) = embedding_lookup(
-            input_ids=input_ids,
-            vocab_size=config.vocab_size,
-            embedding_size=config.hidden_size,
-            initializer_range=config.initializer_range,
-            word_embedding_name="word_embeddings",
-            use_one_hot_embeddings=use_one_hot_embeddings,
-            dtype=config.dtype)
+        with scopes.ipu_shard(embedding_shard_placement["words_embedding"]):
+          (self.embedding_output, self.embedding_table) = embedding_lookup(
+              input_ids=input_ids,
+              vocab_size=config.vocab_size,
+              embedding_size=config.hidden_size,
+              initializer_range=config.initializer_range,
+              word_embedding_name="word_embeddings",
+              use_one_hot_embeddings=use_one_hot_embeddings,
+              dtype=config.dtype)
 
         # Add positional embeddings and token type embeddings, then layer
         # normalize and perform dropout.
-        self.embedding_output = embedding_postprocessor(
-            input_tensor=self.embedding_output,
-            use_token_type=True,
-            token_type_ids=token_type_ids,
-            token_type_vocab_size=config.type_vocab_size,
-            token_type_embedding_name="token_type_embeddings",
-            use_position_embeddings=True,
-            position_embedding_name="position_embeddings",
-            initializer_range=config.initializer_range,
-            max_position_embeddings=config.max_position_embeddings,
-            dropout_prob=config.hidden_dropout_prob,
-            dtype=config.dtype)
+        with scopes.ipu_shard(embedding_shard_placement["positional_segment_embedding"]):
+          self.embedding_output = embedding_postprocessor(
+              input_tensor=self.embedding_output,
+              use_token_type=True,
+              token_type_ids=token_type_ids,
+              token_type_vocab_size=config.type_vocab_size,
+              token_type_embedding_name="token_type_embeddings",
+              use_position_embeddings=True,
+              position_embedding_name="position_embeddings",
+              initializer_range=config.initializer_range,
+              max_position_embeddings=config.max_position_embeddings,
+              dropout_prob=config.hidden_dropout_prob,
+              dtype=config.dtype)
+
+          # This converts a 2D mask of shape [batch_size, seq_length] to a 3D
+          # mask of shape [batch_size, seq_length, seq_length] which is used
+          # for the attention scores.
+          attention_mask = create_attention_mask_from_input_mask(
+              input_ids, input_mask, config.dtype)
 
       with tf.variable_scope("encoder"):
-        # This converts a 2D mask of shape [batch_size, seq_length] to a 3D
-        # mask of shape [batch_size, seq_length, seq_length] which is used
-        # for the attention scores.
-        attention_mask = create_attention_mask_from_input_mask(
-            input_ids, input_mask, config.dtype)
 
         # Run the stacked transformer.
         # `sequence_output` shape = [batch_size, seq_length, hidden_size].
-        self.all_encoder_layers = transformer_model(
+        self.sequence_output = transformer_model(
+            attention_shard_placement,
             input_tensor=self.embedding_output,
             attention_mask=attention_mask,
             hidden_size=config.hidden_size,
@@ -220,24 +238,27 @@ class BertModel(object):
             hidden_dropout_prob=config.hidden_dropout_prob,
             attention_probs_dropout_prob=config.attention_probs_dropout_prob,
             initializer_range=config.initializer_range,
-            do_return_all_layers=True,
+            do_return_all_layers=False,
             dtype=config.dtype)
 
-      self.sequence_output = self.all_encoder_layers[-1]
-      # The "pooler" converts the encoded sequence tensor of shape
-      # [batch_size, seq_length, hidden_size] to a tensor of shape
-      # [batch_size, hidden_size]. This is necessary for segment-level
-      # (or segment-pair-level) classification tasks where we need a fixed
-      # dimensional representation of the segment.
-      with tf.variable_scope("pooler"):
-        # We "pool" the model by simply taking the hidden state corresponding
-        # to the first token. We assume that this has been pre-trained
-        first_token_tensor = tf.squeeze(self.sequence_output[:, 0:1, :], axis=1)
-        self.pooled_output = tf.layers.dense(
-            first_token_tensor,
-            config.hidden_size,
-            activation=tf.tanh,
-            kernel_initializer=create_initializer(config.initializer_range))
+      #comment following line since we did not return all layer from tranformer_model
+      #self.sequence_output = self.all_encoder_layers[-1]
+
+      with scopes.ipu_shard(attention_shard_placement[-1]):
+        # The "pooler" converts the encoded sequence tensor of shape
+        # [batch_size, seq_length, hidden_size] to a tensor of shape
+        # [batch_size, hidden_size]. This is necessary for segment-level
+        # (or segment-pair-level) classification tasks where we need a fixed
+        # dimensional representation of the segment.
+        with tf.variable_scope("pooler"):
+          # We "pool" the model by simply taking the hidden state corresponding
+          # to the first token. We assume that this has been pre-trained
+          first_token_tensor = tf.squeeze(self.sequence_output[:, 0:1, :], axis=1)
+          self.pooled_output = tf.layers.dense(
+              first_token_tensor,
+              config.hidden_size,
+              activation=tf.tanh,
+              kernel_initializer=create_initializer(config.initializer_range))
 
   def get_pooled_output(self):
     return self.pooled_output
@@ -363,7 +384,8 @@ def dropout(input_tensor, dropout_prob):
   if dropout_prob is None or dropout_prob == 0.0:
     return input_tensor
 
-  output = tf.nn.dropout(input_tensor, 1.0 - dropout_prob)
+  #output = tf.nn.dropout(input_tensor, 1.0 - dropout_prob)
+  output = ipu.ops.rand_ops.dropout(input_tensor, rate=dropout_prob)
   return output
 
 
@@ -422,12 +444,15 @@ def embedding_lookup(input_ids,
       initializer=create_initializer(initializer_range))
 
   flat_input_ids = tf.reshape(input_ids, [-1])
+  """
   if use_one_hot_embeddings:
     one_hot_input_ids = tf.one_hot(flat_input_ids, depth=vocab_size)
     output = tf.matmul(one_hot_input_ids, embedding_table)
   else:
     output = tf.gather(embedding_table, flat_input_ids)
+  """
 
+  output = embedding_lookup_ipu(embedding_table,flat_input_ids, name='emb_lookup_ipu_words')
   input_shape = get_shape_list(input_ids)
 
   output = tf.reshape(output,
@@ -492,8 +517,11 @@ def embedding_postprocessor(input_tensor,
     # This vocab will be small so we always do one-hot here, since it is always
     # faster for a small vocabulary.
     flat_token_type_ids = tf.reshape(token_type_ids, [-1])
+    """
     one_hot_ids = tf.one_hot(flat_token_type_ids, depth=token_type_vocab_size, dtype=dtype)
     token_type_embeddings = tf.matmul(one_hot_ids, token_type_table)
+    """
+    token_type_embeddings = embedding_lookup_ipu(token_type_table, flat_token_type_ids, name='emb_lookup_ipu_token_type')
     token_type_embeddings = tf.reshape(token_type_embeddings,
                                        [batch_size, seq_length, width])
     output += token_type_embeddings
@@ -765,7 +793,8 @@ def attention_layer(from_tensor,
   return context_layer
 
 
-def transformer_model(input_tensor,
+def transformer_model(shard_placement,
+                      input_tensor,
                       attention_mask=None,
                       hidden_size=768,
                       num_hidden_layers=12,
@@ -837,75 +866,79 @@ def transformer_model(input_tensor,
   # help the optimizer.
   prev_output = reshape_to_matrix(input_tensor)
 
-  all_layer_outputs = []
+  if do_return_all_layers:
+    all_layer_outputs = []
   for layer_idx in range(num_hidden_layers):
-    with tf.variable_scope("layer_%d" % layer_idx):
-      layer_input = prev_output
+    with scopes.ipu_shard(shard_placement[layer_idx]):
+      with tf.variable_scope("layer_%d" % layer_idx):
+        layer_input = prev_output
 
-      with tf.variable_scope("attention"):
-        attention_heads = []
-        with tf.variable_scope("self"):
-          attention_head = attention_layer(
-              from_tensor=layer_input,
-              to_tensor=layer_input,
-              attention_mask=attention_mask,
-              num_attention_heads=num_attention_heads,
-              size_per_head=attention_head_size,
-              attention_probs_dropout_prob=attention_probs_dropout_prob,
-              initializer_range=initializer_range,
-              do_return_2d_tensor=True,
-              batch_size=batch_size,
-              from_seq_length=seq_length,
-              to_seq_length=seq_length,
-              dtype=dtype)
-          attention_heads.append(attention_head)
+        with tf.variable_scope("attention"):
+          attention_heads = []
+          with tf.variable_scope("self"):
+            attention_head = attention_layer(
+                from_tensor=layer_input,
+                to_tensor=layer_input,
+                attention_mask=attention_mask,
+                num_attention_heads=num_attention_heads,
+                size_per_head=attention_head_size,
+                attention_probs_dropout_prob=attention_probs_dropout_prob,
+                initializer_range=initializer_range,
+                do_return_2d_tensor=True,
+                batch_size=batch_size,
+                from_seq_length=seq_length,
+                to_seq_length=seq_length,
+                dtype=dtype)
+            attention_heads.append(attention_head)
 
-        attention_output = None
-        if len(attention_heads) == 1:
-          attention_output = attention_heads[0]
-        else:
-          # In the case where we have other sequences, we just concatenate
-          # them to the self-attention head before the projection.
-          attention_output = tf.concat(attention_heads, axis=-1)
+          attention_output = None
+          if len(attention_heads) == 1:
+            attention_output = attention_heads[0]
+          else:
+            # In the case where we have other sequences, we just concatenate
+            # them to the self-attention head before the projection.
+            attention_output = tf.concat(attention_heads, axis=-1)
 
-        # Run a linear projection of `hidden_size` then add a residual
-        # with `layer_input`.
-        with tf.variable_scope("output"):
-          attention_output = tf.layers.dense(
+          # Run a linear projection of `hidden_size` then add a residual
+          # with `layer_input`.
+          with tf.variable_scope("output"):
+            attention_output = tf.layers.dense(
+                attention_output,
+                hidden_size,
+                kernel_initializer=create_initializer(initializer_range))
+            attention_output = dropout(attention_output, hidden_dropout_prob)
+            attention_output = layer_norm(attention_output + layer_input)
+
+        # The activation is only applied to the "intermediate" hidden layer.
+        with tf.variable_scope("intermediate"):
+          intermediate_output = tf.layers.dense(
               attention_output,
+              intermediate_size,
+              activation=intermediate_act_fn,
+              kernel_initializer=create_initializer(initializer_range))
+
+        # Down-project back to `hidden_size` then add the residual.
+        with tf.variable_scope("output"):
+          layer_output = tf.layers.dense(
+              intermediate_output,
               hidden_size,
               kernel_initializer=create_initializer(initializer_range))
-          attention_output = dropout(attention_output, hidden_dropout_prob)
-          attention_output = layer_norm(attention_output + layer_input)
+          layer_output = dropout(layer_output, hidden_dropout_prob)
+          layer_output = layer_norm(layer_output + attention_output)
+          prev_output = layer_output
+          if do_return_all_layers:
+            all_layer_outputs.append(layer_output)
 
-      # The activation is only applied to the "intermediate" hidden layer.
-      with tf.variable_scope("intermediate"):
-        intermediate_output = tf.layers.dense(
-            attention_output,
-            intermediate_size,
-            activation=intermediate_act_fn,
-            kernel_initializer=create_initializer(initializer_range))
-
-      # Down-project back to `hidden_size` then add the residual.
-      with tf.variable_scope("output"):
-        layer_output = tf.layers.dense(
-            intermediate_output,
-            hidden_size,
-            kernel_initializer=create_initializer(initializer_range))
-        layer_output = dropout(layer_output, hidden_dropout_prob)
-        layer_output = layer_norm(layer_output + attention_output)
-        prev_output = layer_output
-        all_layer_outputs.append(layer_output)
-
-  if do_return_all_layers:
-    final_outputs = []
-    for layer_output in all_layer_outputs:
-      final_output = reshape_from_matrix(layer_output, input_shape)
-      final_outputs.append(final_output)
-    return final_outputs
-  else:
-    final_output = reshape_from_matrix(prev_output, input_shape)
-    return final_output
+      if layer_idx == num_hidden_layers - 1:
+        if do_return_all_layers:
+          final_outputs = []
+          for layer_output in all_layer_outputs:
+            final_output = reshape_from_matrix(layer_output, input_shape)
+            final_outputs.append(final_output)
+          return final_outputs
+        else:
+          final_output = reshape_from_matrix(prev_output, input_shape)
+          return final_output
 
 
 def get_shape_list(tensor, expected_rank=None, name=None):
