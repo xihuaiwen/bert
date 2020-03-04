@@ -22,11 +22,12 @@ import os
 import sys
 import modeling
 import optimization
-import tensorflow as tf
 import math
-import pdb
+import time
+import numpy as np
 
-from collections import namedtuple
+from collections import namedtuple,OrderedDict
+import tensorflow as tf
 from tensorflow.python.ipu.scopes import ipu_scope
 from tensorflow.python.ipu import utils, scopes
 from tensorflow.python import ipu
@@ -86,14 +87,9 @@ flags.DEFINE_integer("num_warmup_steps", 10000, "Number of warmup steps.")
 flags.DEFINE_integer("save_checkpoints_steps", 1000,
                      "How often to save the model checkpoint.")
 
-flags.DEFINE_integer("iterations_per_loop", 1000,
-                     "How many steps to make in each estimator call.")
-
 flags.DEFINE_integer("max_eval_steps", 100, "Maximum number of eval steps.")
 
-flags.DEFINE_integer("epoches", 1, "How many epoches for training.")
-
-flags.DEFINE_bool("use_ipu", False, "Whether to user Graphcore IPU.")
+flags.DEFINE_integer("epochs", 1, "How many epoches for training.")
 
 flags.DEFINE_integer("layers_per_ipu", 2 , "attention layers per IPU")
 
@@ -102,32 +98,6 @@ flags.DEFINE_bool("ipu_profile", False, "Whether to enable Graphcore IPU event t
 flags.DEFINE_integer("ipu_log_interval", 100, "Interval at which to log progress.")
 
 flags.DEFINE_integer("ipu_summary_interval", 1, "Interval at which to write summaries.")
-
-flags.DEFINE_bool("use_tpu", False, "Whether to use TPU or GPU/CPU.")
-
-tf.flags.DEFINE_string(
-    "tpu_name", None,
-    "The Cloud TPU to use for training. This should be either the name "
-    "used when creating the Cloud TPU, or a grpc://ip.address.of.tpu:8470 "
-    "url.")
-
-tf.flags.DEFINE_string(
-    "tpu_zone", None,
-    "[Optional] GCE zone where the Cloud TPU is located in. If not "
-    "specified, we will attempt to automatically detect the GCE project from "
-    "metadata.")
-
-tf.flags.DEFINE_string(
-    "gcp_project", None,
-    "[Optional] Project name for the Cloud TPU-enabled project. If not "
-    "specified, we will attempt to automatically detect the GCE project from "
-    "metadata.")
-
-tf.flags.DEFINE_string("master", None, "[Optional] TensorFlow master URL.")
-
-flags.DEFINE_integer(
-    "num_tpu_cores", 8,
-    "Only used if `use_tpu` is True. Total number of TPU cores to use.")
 
 GraphOps = namedtuple(
      'graphOps', ['graph',
@@ -149,14 +119,74 @@ def calculate_required_ipus(num_hidden_layers):
     print ("Cannot meet the IPU resource allocation request, you required %d" % (num_shards))
     sys.exit(1)
 
-def training_graph(bert_config,learning_rate,iterations_per_step):
+def training_process(bert_config,FLAGS):
+
+    tf.logging.info("***** Running training *****")
+    tf.logging.info("  Batch size = %d", FLAGS.train_batch_size)
+
+    total_samples = get_dataset_files_count(FLAGS.input_file)
+    logs_per_epoch = 10000
+    iterations_per_epoch = total_samples / FLAGS.train_batch_size
+    iterations = FLAGS.epochs * iterations_per_epoch
+    log_freq = iterations_per_epoch // logs_per_epoch
+    iterations_per_step = 10
+
+    # -------------- BUILD TRAINING GRAPH ----------------                    
+    train = training_graph(
+            bert_config=bert_config,
+            input_files=FLAGS.input_file,
+            learning_rate=FLAGS.learning_rate,
+            iterations_per_step=10,
+            )
+    train.session.run(train.init)
+    train.session.run(train.iterator.initializer)
+    # -------------- BUILD VALIDATION GRAPH ----------------
+    # -------------- SAVE AND RESTORE --------------
+
+    print_format = ("epochs: {epoch_idx:6d}, total_loss: {total_loss_mean:6.5f}, mlm_loss: {mlm_loss_mean:6.5f}, nsp_loss: {nsp_loss_mean:6.3f}, samples/s: {avg_samples_per_sec} ")
+    i = 0
+    batch_times = []
+    epoch_idx = 1
+    while i < 100000:
+        
+        train.session.run(train.ops)
+        start_time = time.time()
+        total_loss,mlm_loss,nsp_loss = train.session.run(train.outfeed)
+        batch_time = time.time() - start_time
+        batch_time /= iterations_per_step 
+        if i != 0:
+          batch_times.append(batch_time)
+
+        log_this_step = True 
+
+        if log_this_step:
+          if len(batch_times) != 0:
+            avg_batch_time = np.mean(batch_times)
+          else:
+            avg_batch_time = batch_time
+          avg_samples_per_sec = FLAGS.train_batch_size / avg_batch_time
+          total_loss_mean = np.mean(total_loss)
+          mlm_loss_mean  = np.mean(mlm_loss)
+          nsp_loss_mean = np.mean(nsp_loss) 
+          stats =OrderedDict([
+            ("epoch_idx",epoch_idx),
+            ("total_loss_mean",total_loss_mean),
+            ("mlm_loss_mean",mlm_loss_mean),
+            ("nsp_loss_mean",nsp_loss_mean),
+            ("avg_samples_per_sec",avg_samples_per_sec)
+          ])
+          tf.logging.info(print_format.format(**stats))
+
+        i += iterations_per_step
+
+def training_graph(bert_config,input_files,learning_rate,iterations_per_step):
     train_graph = tf.Graph()
     with train_graph.as_default():
         ds = get_pretraining_dataset(FLAGS.train_batch_size,
-              FLAGS.input_file,
-              FLAGS.max_seq_length,
-              FLAGS.max_predictions_per_seq,
-              is_training=True)
+                        FLAGS.input_file,
+                        FLAGS.max_seq_length,
+                        FLAGS.max_predictions_per_seq,
+                        is_training=True)
         infeed_queue = ipu_infeed_queue.IPUInfeedQueue(ds, feed_name="infeed")
         outfeed_queue = ipu_outfeed_queue.IPUOutfeedQueue(feed_name="outfeed")
 
@@ -164,28 +194,28 @@ def training_graph(bert_config,learning_rate,iterations_per_step):
             train = training_step_with_infeeds_and_outfeeds(infeed_queue, outfeed_queue,
                     bert_config, learning_rate, iterations_per_step)
         outfeed = outfeed_queue.dequeue()
-     #   logging.print_trainable_variables(opts)
+#        logging.print_trainable_variables(opts)
         train_saver = tf.train.Saver(max_to_keep=999999)
         ipu.utils.move_variable_initialization_to_cpu()
 
         train_init = tf.global_variables_initializer()
 
     config = utils.create_ipu_config()
-    config = utils.auto_select_ipus(config,4)
+    config = utils.auto_select_ipus(config,8)
+
     config = utils.set_compilation_options(config, {
         "device.clearAtomicFlagAfterExchange": "false",
         "prng.enable": "true",
         "target.deterministicWorkers": "false" ,
         })
-    utils.set_recomputation_options(config, allow_recompute=True)
+    config = utils.set_convolution_options(config, {"availableMemoryProportion": "0,23"})
+    config = utils.set_matmul_options(config,{"availableMemoryProportion": "0.23"})
+    config = utils.set_recomputation_options(config, allow_recompute=True)
     config = utils.set_floating_point_behaviour_options(config , nanoo=True)
-
     ipu.utils.configure_ipu_system(config)
 
     train_sess = tf.Session(graph=train_graph, config=tf.ConfigProto())
-    return GraphOps(train_graph, train_sess, train_init, [train], infeed_queue, outfeed_queue, train_saver)
-
-    
+    return GraphOps(train_graph, train_sess, train_init, [train], infeed_queue, outfeed, train_saver)
 
 def training_step_with_infeeds_and_outfeeds (infeed, outfeed, bert_config,learning_rate,iterations_per_step):
   def training_step(input_ids,input_mask,segment_ids,masked_lm_positions,masked_lm_ids,masked_lm_weights,next_sentence_labels):  # pylint: disable=unused-argument
@@ -404,7 +434,6 @@ def get_masked_lm_output(bert_config, input_tensor, output_weights, positions,
 
   return (loss, per_example_loss, log_probs)
 
-
 def get_next_sentence_output(bert_config, input_tensor, labels):
   """Get loss and log probs for the next sentence prediction."""
 
@@ -431,7 +460,6 @@ def get_next_sentence_output(bert_config, input_tensor, labels):
     loss = tf.reduce_mean(per_example_loss)
     return (loss, per_example_loss, log_probs)
 
-
 def gather_indexes(sequence_tensor, positions):
   """Gathers the vectors at the specific positions over a minibatch."""
   sequence_shape = modeling.get_shape_list(sequence_tensor, expected_rank=3)
@@ -447,10 +475,17 @@ def gather_indexes(sequence_tensor, positions):
   output_tensor = tf.gather(flat_sequence_tensor, flat_positions)
   return output_tensor
 
+def get_dataset_files_count(input_file):
+  input_files = []
+  for input_pattern in FLAGS.input_file.split(","):
+    input_files.extend(tf.gfile.Glob(input_pattern))
+
+  total_samples = 0
+  for input_file in input_files:
+    total_samples += sum(1 for _ in tf.python_io.tf_record_iterator(input_file))
+  return total_samples
+
 def get_pretraining_dataset(batch_size,input_file,max_seq_length,max_predictions_per_seq,is_training,num_cpu_threads=4):
-
- 
-
   input_files = []
   for input_pattern in FLAGS.input_file.split(","):
     input_files.extend(tf.gfile.Glob(input_pattern))
@@ -526,7 +561,6 @@ def _decode_record(record, name_to_features):
 
   return example
 
-
 def main(_):
   tf.logging.set_verbosity(tf.logging.INFO)
 
@@ -537,54 +571,12 @@ def main(_):
 
   tf.gfile.MakeDirs(FLAGS.output_dir)
 
-  input_files = []
-  for input_pattern in FLAGS.input_file.split(","):
-    input_files.extend(tf.gfile.Glob(input_pattern))
-
-  tf.logging.info("*** Input Files ***")
-  for input_file in input_files:
-    tf.logging.info("  %s" % input_file)
-
-
   if FLAGS.do_train:
-    tf.logging.info("***** Running training *****")
-    tf.logging.info("  Batch size = %d", FLAGS.train_batch_size)
-    ds = get_pretraining_dataset(FLAGS.train_batch_size,
-                        input_files,
-                        FLAGS.max_seq_length,
-                        FLAGS.max_predictions_per_seq,
-                        is_training=True)
-
-    train = training_graph(
-            bert_config=bert_config,
-            learning_rate=FLAGS.learning_rate,
-            iterations_per_step=10,
-            )
-    train.session.run(train.init)
-    train.session.run(train.iterator.initializer)
-    while True:
-        train.session.run(train.ops)
+    training_process(bert_config,FLAGS)
 
   if FLAGS.do_eval:
-    tf.logging.info("***** Running evaluation *****")
-    tf.logging.info("  Batch size = %d", FLAGS.eval_batch_size)
-
-    eval_input_fn = input_fn_builder(
-        input_files=input_files,
-        max_seq_length=FLAGS.max_seq_length,
-        max_predictions_per_seq=FLAGS.max_predictions_per_seq,
-        is_training=False)
-
-    result = estimator.evaluate(
-        input_fn=eval_input_fn, steps=FLAGS.max_eval_steps)
-
-    output_eval_file = os.path.join(FLAGS.output_dir, "eval_results.txt")
-    with tf.gfile.GFile(output_eval_file, "w") as writer:
-      tf.logging.info("***** Eval results *****")
-      for key in sorted(result.keys()):
-        tf.logging.info("  %s = %s", key, str(result[key]))
-        writer.write("%s = %s\n" % (key, str(result[key])))
-
+    pass
+    
 
 if __name__ == "__main__":
   flags.mark_flag_as_required("input_file")
