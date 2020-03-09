@@ -269,6 +269,10 @@ def create_ipu_estimator(FLAGS, model_fn, bert_config):
   ipu.utils.set_recomputation_options(ipu_options, allow_recompute=True)
   cfg = ipu.utils.auto_select_ipus(ipu_options, num_ipus=required_ipus)
 
+  from tensorflow.core.protobuf import rewriter_config_pb2
+  sess_cfg = tf.ConfigProto()
+  sess_cfg.graph_options.rewrite_options.memory_optimization = (rewriter_config_pb2.RewriterConfig.OFF)
+
   ipu_run_config = ipu.ipu_run_config.IPURunConfig(
                      iterations_per_loop=FLAGS.iterations_per_loop,
                      ipu_options=ipu_options,
@@ -276,15 +280,27 @@ def create_ipu_estimator(FLAGS, model_fn, bert_config):
 
   config = ipu.ipu_run_config.RunConfig(
                     ipu_run_config=ipu_run_config,
+                    session_config=sess_cfg,
                     log_step_count_steps=FLAGS.ipu_log_interval,
                     save_summary_steps=FLAGS.ipu_summary_interval,
                     model_dir=FLAGS.output_dir)
 
-  return ipu.ipu_estimator.IPUEstimator(
+  if (FLAGS.init_checkpoint):
+    warm_start_settings = tf.estimator.WarmStartSettings(
+      ckpt_to_initialize_from=FLAGS.init_checkpoint,
+      vars_to_warm_start = ".*bert*.*"
+    )
+    return ipu.ipu_estimator.IPUEstimator(
           config=config,
           model_fn=model_fn,
           params={"learning_rate": FLAGS.learning_rate,
-          "batch_size":FLAGS.train_batch_size})
+          "batch_size":FLAGS.train_batch_size},warm_start_from=warm_start_settings)
+  else:
+    return ipu.ipu_estimator.IPUEstimator(
+            config=config,
+            model_fn=model_fn,
+            params={"learning_rate": FLAGS.learning_rate,
+            "batch_size":FLAGS.train_batch_size})
 
 def create_estimator(FLAGS, model_fn, bert_config):
   tpu_cluster_resolver = None
@@ -643,9 +659,10 @@ def create_model_ipu(bert_config, is_training, input_ids, input_mask, segment_id
       token_type_ids=segment_ids,
       use_one_hot_embeddings=use_one_hot_embeddings)
 
+  # pdb.set_trace()
   final_hidden = model.get_sequence_output()
 
-  final_hidden_shape = modeling.get_shape_list(final_hidden, expected_rank=3)
+  final_hidden_shape = modeling_ipu.get_shape_list(final_hidden, expected_rank=3)
   batch_size = final_hidden_shape[0]
   seq_length = final_hidden_shape[1]
   hidden_size = final_hidden_shape[2]
@@ -678,7 +695,7 @@ def create_model_ipu(bert_config, is_training, input_ids, input_mask, segment_id
 def create_model(bert_config, is_training, input_ids, input_mask, segment_ids,
                  use_one_hot_embeddings):
   """Creates a classification model."""
-  model = modeling.BertModel(
+  model = modeling_ipu.BertModel(
       config=bert_config,
       is_training=is_training,
       input_ids=input_ids,
@@ -688,7 +705,7 @@ def create_model(bert_config, is_training, input_ids, input_mask, segment_ids,
 
   final_hidden = model.get_sequence_output()
 
-  final_hidden_shape = modeling.get_shape_list(final_hidden, expected_rank=3)
+  final_hidden_shape = modeling_ipu.get_shape_list(final_hidden, expected_rank=3)
   batch_size = final_hidden_shape[0]
   seq_length = final_hidden_shape[1]
   hidden_size = final_hidden_shape[2]
@@ -749,8 +766,11 @@ def model_fn_builder_ipu(bert_config,init_checkpoint,
     scaffold_fn = None
     if init_checkpoint:
       (assignment_map, initialized_variable_names
-      ) = modeling.get_assignment_map_from_checkpoint(tvars, init_checkpoint)
+      ) = modeling_ipu.get_assignment_map_from_checkpoint(tvars, init_checkpoint)
       tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
+      print("######################################################")
+      print(assignment_map)
+      print("######################################################")
 
     tf.logging.info("**** Trainable Variables ****")
     for var in tvars:
@@ -762,7 +782,7 @@ def model_fn_builder_ipu(bert_config,init_checkpoint,
 
     output_spec = None
     if mode == tf.estimator.ModeKeys.TRAIN:
-      seq_length = modeling.get_shape_list(input_ids)[1]
+      seq_length = modeling_ipu.get_shape_list(input_ids)[1]
 
       def compute_loss(logits, positions):
         one_hot_positions = tf.one_hot(
@@ -836,7 +856,7 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
     scaffold_fn = None
     if init_checkpoint:
       (assignment_map, initialized_variable_names
-      ) = modeling.get_assignment_map_from_checkpoint(tvars, init_checkpoint)
+      ) = modeling_ipu.get_assignment_map_from_checkpoint(tvars, init_checkpoint)
       if use_tpu:
 
         def tpu_scaffold():
@@ -857,7 +877,7 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
 
     output_spec = None
     if mode == tf.estimator.ModeKeys.TRAIN:
-      seq_length = modeling.get_shape_list(input_ids)[1]
+      seq_length = modeling_ipu.get_shape_list(input_ids)[1]
 
       def compute_loss(logits, positions):
         one_hot_positions = tf.one_hot(
@@ -930,14 +950,16 @@ def input_fn_builder(input_file, seq_length, is_training, drop_remainder):
   def input_fn(params):
     """The actual input function."""
     batch_size = params["batch_size"]
-
+    print("###########################predict batch size##################################"+str(batch_size))
     # For training, we want a lot of parallel reading and shuffling.
     # For eval, we want no shuffling and parallel reading doesn't matter.
+    # pdb.set_trace()
     d = tf.data.TFRecordDataset(input_file)
     if is_training:
       d = d.repeat()
       d = d.shuffle(buffer_size=100)
-
+    # pdb.set_trace()
+    # d=d.repeat()
     d = d.apply(
         tf.contrib.data.map_and_batch(
             lambda record: _decode_record(record, name_to_features),
@@ -959,7 +981,7 @@ def write_predictions(all_examples, all_features, all_results, n_best_size,
   """Write final predictions to the json file and log-odds of null if needed."""
   tf.logging.info("Writing predictions to: %s" % (output_prediction_file))
   tf.logging.info("Writing nbest to: %s" % (output_nbest_file))
-
+  # pdb.set_trace()
   example_index_to_features = collections.defaultdict(list)
   for feature in all_features:
     example_index_to_features[feature.example_index].append(feature)
@@ -986,6 +1008,7 @@ def write_predictions(all_examples, all_features, all_results, n_best_size,
     null_start_logit = 0  # the start logit at the slice with min null score
     null_end_logit = 0  # the end logit at the slice with min null score
     for (feature_index, feature) in enumerate(features):
+      # pdb.set_trace()
       result = unique_id_to_result[feature.unique_id]
       start_indexes = _get_best_indexes(result.start_logits, n_best_size)
       end_indexes = _get_best_indexes(result.end_logits, n_best_size)
@@ -1341,7 +1364,7 @@ def validate_flags_or_throw(bert_config):
 def main(_):
   tf.logging.set_verbosity(tf.logging.INFO)
 
-  bert_config = modeling.BertConfig.from_json_file(FLAGS.bert_config_file)
+  bert_config = modeling_ipu.BertConfig.from_json_file(FLAGS.bert_config_file)
   bert_config.attention_layers_per_ipu = FLAGS.attention_layers_per_ipu
   if FLAGS.use_fp16:
     bert_config.dtype = tf.float16
@@ -1419,7 +1442,7 @@ def main(_):
 
   if FLAGS.do_predict:
     eval_examples = read_squad_examples(
-        input_file=FLAGS.predict_file, is_training=False)
+        input_file=FLAGS.predict_file, is_training=False)[:200]
 
     eval_writer = FeatureWriter(
         filename=os.path.join(FLAGS.output_dir, "eval.tf_record"),
@@ -1451,15 +1474,15 @@ def main(_):
         input_file=eval_writer.filename,
         seq_length=FLAGS.max_seq_length,
         is_training=False,
-        drop_remainder=False)
+        drop_remainder=True)
 
     # If running eval on the TPU, you will need to specify the number of
     # steps.
     all_results = []
-    for result in estimator.predict(
-        predict_input_fn, yield_single_examples=True):
-      if len(all_results) % 1000 == 0:
-        tf.logging.info("Processing example: %d" % (len(all_results)))
+    for result in estimator.predict(predict_input_fn, yield_single_examples=True):
+      # if len(all_results) % 100 == 0:
+      tf.logging.info("Processing example: %d" % (len(all_results)))
+
       unique_id = int(result["unique_ids"])
       start_logits = [float(x) for x in result["start_logits"].flat]
       end_logits = [float(x) for x in result["end_logits"].flat]
