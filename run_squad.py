@@ -40,6 +40,25 @@ import pdb
 IPU_MODEL = False
 if IPU_MODEL:
     os.environ['TF_POPLAR_FLAGS'] = "--use_ipu_model"
+class ProfilerHook(tf.train.SessionRunHook):
+    """Estimator hook to generate and write a Poplar report to write_dir"""
+    def __init__(self, write_dir, name=''):
+        self._write_dir = write_dir
+        self._name = name
+
+    def begin(self):
+        from tensorflow.compiler.plugin.poplar.ops import gen_ipu_ops
+        self._report_op = gen_ipu_ops.ipu_event_trace()
+
+    def end(self, session):
+        import os
+        raw_report = session.run(self._report_op)
+        write_file = os.path.join(self._write_dir, f'{self._name}_report.txt')
+        with open(write_file, 'w') as f:
+            f.write(ipu.utils.extract_all_strings_from_event_trace(raw_report))
+        print(f"Wrote profiling report to {write_file}")
+
+profiler_hook = ProfilerHook(write_dir='./profile')
 
 #tf_report
 from tensorflow.compiler.plugin.poplar.ops import gen_ipu_ops
@@ -1494,7 +1513,7 @@ def main(_):
     # If running eval on the TPU, you will need to specify the number of
     # steps.
     all_results = []
-    for result in estimator.predict(predict_input_fn, yield_single_examples=True,num_predictions=len(eval_examples)//FLAGS.predict_batch_size):
+    for result in estimator.predict(predict_input_fn, yield_single_examples=True,hooks=[profiler_hook],num_predictions=len(eval_examples)//FLAGS.predict_batch_size):
       if len(all_results) % 100 == 0:
         tf.logging.info("Processing example: %d" % (len(all_results)))
 
