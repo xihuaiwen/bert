@@ -452,7 +452,7 @@ def embedding_lookup(input_ids,
     output = tf.gather(embedding_table, flat_input_ids)
   """
 
-  output = embedding_lookup_ipu(embedding_table,flat_input_ids, name='emb_lookup_ipu_words')
+  output = tf.nn.embedding_lookup(embedding_table,flat_input_ids, name='emb_lookup_ipu_words')
   input_shape = get_shape_list(input_ids)
 
   output = tf.reshape(output,
@@ -521,7 +521,7 @@ def embedding_postprocessor(input_tensor,
     one_hot_ids = tf.one_hot(flat_token_type_ids, depth=token_type_vocab_size, dtype=dtype)
     token_type_embeddings = tf.matmul(one_hot_ids, token_type_table)
     """
-    token_type_embeddings = embedding_lookup_ipu(token_type_table, flat_token_type_ids, name='emb_lookup_ipu_token_type')
+    token_type_embeddings = tf.nn.embedding_lookup(token_type_table, flat_token_type_ids, name='emb_lookup_ipu_token_type')
     token_type_embeddings = tf.reshape(token_type_embeddings,
                                        [batch_size, seq_length, width])
     output += token_type_embeddings

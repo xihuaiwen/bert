@@ -35,6 +35,18 @@ from tensorflow.python.ipu.optimizers import sharded_optimizer
 from tensorflow.python.training import gradient_descent
 import pdb
 
+
+#true to use virtul ipu
+IPU_MODEL = False
+if IPU_MODEL:
+    os.environ['TF_POPLAR_FLAGS'] = "--use_ipu_model"
+
+#tf_report
+from tensorflow.compiler.plugin.poplar.ops import gen_ipu_ops
+from gc_profile import save_tf_report
+with tf.device('cpu'):
+    report = gen_ipu_ops.ipu_event_trace()
+
 flags = tf.flags
 
 FLAGS = flags.FLAGS
@@ -107,7 +119,7 @@ flags.DEFINE_float(
 flags.DEFINE_integer("save_checkpoints_steps", 1000,
                      "How often to save the model checkpoint.")
 
-flags.DEFINE_integer("iterations_per_loop", 1000,
+flags.DEFINE_integer("iterations_per_loop", 1,
                      "How many steps to make in each estimator call.")
 
 flags.DEFINE_integer(
@@ -124,7 +136,7 @@ flags.DEFINE_bool("use_fp16", False, "Whether to use half precision float to tra
 
 flags.DEFINE_bool("use_ipu", False, "Whether to use Graphcore IPU.")
 
-flags.DEFINE_bool("ipu_profiling", False, "Whether to enable profiling for Graphcore IPU.")
+flags.DEFINE_bool("ipu_profiling", True, "Whether to enable profiling for Graphcore IPU.")
 
 flags.DEFINE_integer("ipu_log_interval", 100, "Interval at which to log progress.")
 
@@ -267,6 +279,7 @@ def create_ipu_estimator(FLAGS, model_fn, bert_config):
   ipu_options = ipu.utils.set_convolution_options(ipu_options, {"availableMemoryProportion": "0,23"})
   ipu_options = ipu.utils.set_matmul_options(ipu_options,{"availableMemoryProportion": "0.23"})
   ipu.utils.set_recomputation_options(ipu_options, allow_recompute=True)
+  ipu.utils.set_optimization_options(ipu_options, gather_simplifier=False)
   cfg = ipu.utils.auto_select_ipus(ipu_options, num_ipus=required_ipus)
 
   from tensorflow.core.protobuf import rewriter_config_pb2
@@ -1009,6 +1022,8 @@ def write_predictions(all_examples, all_features, all_results, n_best_size,
     null_end_logit = 0  # the end logit at the slice with min null score
     for (feature_index, feature) in enumerate(features):
       # pdb.set_trace()
+      if feature.unique_id >= len(unique_id_to_result):
+        continue
       result = unique_id_to_result[feature.unique_id]
       start_indexes = _get_best_indexes(result.start_logits, n_best_size)
       end_indexes = _get_best_indexes(result.end_logits, n_best_size)
@@ -1442,7 +1457,7 @@ def main(_):
 
   if FLAGS.do_predict:
     eval_examples = read_squad_examples(
-        input_file=FLAGS.predict_file, is_training=False)[:200]
+        input_file=FLAGS.predict_file, is_training=False)[:10]
 
     eval_writer = FeatureWriter(
         filename=os.path.join(FLAGS.output_dir, "eval.tf_record"),
@@ -1479,9 +1494,9 @@ def main(_):
     # If running eval on the TPU, you will need to specify the number of
     # steps.
     all_results = []
-    for result in estimator.predict(predict_input_fn, yield_single_examples=True):
-      # if len(all_results) % 100 == 0:
-      tf.logging.info("Processing example: %d" % (len(all_results)))
+    for result in estimator.predict(predict_input_fn, yield_single_examples=True,num_predictions=len(eval_examples)//FLAGS.predict_batch_size):
+      if len(all_results) % 100 == 0:
+        tf.logging.info("Processing example: %d" % (len(all_results)))
 
       unique_id = int(result["unique_ids"])
       start_logits = [float(x) for x in result["start_logits"].flat]
@@ -1491,6 +1506,13 @@ def main(_):
               unique_id=unique_id,
               start_logits=start_logits,
               end_logits=end_logits))
+
+      #tf_report
+      # out = estimator.run(report)
+      # save_tf_report(out)
+
+      # if len(all_results) == 199:
+      #   break
 
     output_prediction_file = os.path.join(FLAGS.output_dir, "predictions.json")
     output_nbest_file = os.path.join(FLAGS.output_dir, "nbest_predictions.json")
