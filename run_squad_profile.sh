@@ -1,0 +1,16 @@
+gc-profile -d squad-profile -- python run_squad.py --vocab_file=cased_L-12_H-768_A-12-F16/vocab.txt \
+    --bert_config_file=cased_L-12_H-768_A-12-F16/bert_config.json \
+    --init_checkpoint=cased_L-12_H-768_A-12-F16/bert_model.ckpt \
+    --do_train=False \
+    --train_file=SQUAD_DIR/train-v1.1.json \
+    --do_predict=True \
+    --predict_file=SQUAD_DIR/dev-v1.1.json \
+    --train_batch_size=1 \
+    --learning_rate=3e-5 \
+    --num_train_epochs=2.0 \
+    --max_seq_length=128 \
+    --doc_stride=128 \
+    --output_dir=./tmp/squad_base/ \
+    --do_lower_case=False	\
+    --use_ipu=True \
+    --use_fp16=True  
