@@ -28,7 +28,7 @@ import six
 import tensorflow as tf
 from tensorflow.python import ipu
 from tensorflow.python.ipu import utils, scopes
-from tensorflow.python.ipu.ops.embedding_ops import embedding_lookup as embedding_lookup_ipu
+from tensorflow.python.ipu import normalization_ops
 
 
 class BertConfig(object):
@@ -187,11 +187,12 @@ class BertModel(object):
             }
     attention_shard_placement = [(int(math.ceil(i/config.attention_layers_per_ipu)) + 2) for i in range(0,config.num_hidden_layers)]
 
+    print('-----ipu_shard placement----', embedding_shard_placement)
     with tf.variable_scope(scope, default_name="bert"):
       with tf.variable_scope("embeddings"):
         # Perform embedding lookup on the word ids.
         with scopes.ipu_shard(embedding_shard_placement["words_embedding"]):
-          (self.embedding_output, self.embedding_table) = embedding_lookup(
+          self.embedding_output = embedding_lookup(
               input_ids=input_ids,
               vocab_size=config.vocab_size,
               embedding_size=config.hidden_size,
@@ -243,25 +244,8 @@ class BertModel(object):
 
       #comment following line since we did not return all layer from tranformer_model
       #self.sequence_output = self.all_encoder_layers[-1]
-
-      with scopes.ipu_shard(attention_shard_placement[-1]):
-        # The "pooler" converts the encoded sequence tensor of shape
-        # [batch_size, seq_length, hidden_size] to a tensor of shape
-        # [batch_size, hidden_size]. This is necessary for segment-level
-        # (or segment-pair-level) classification tasks where we need a fixed
-        # dimensional representation of the segment.
-        with tf.variable_scope("pooler"):
-          # We "pool" the model by simply taking the hidden state corresponding
-          # to the first token. We assume that this has been pre-trained
-          first_token_tensor = tf.squeeze(self.sequence_output[:, 0:1, :], axis=1)
-          self.pooled_output = tf.layers.dense(
-              first_token_tensor,
-              config.hidden_size,
-              activation=tf.tanh,
-              kernel_initializer=create_initializer(config.initializer_range))
-
-  def get_pooled_output(self):
-    return self.pooled_output
+      print('----attention_shard_placement------', attention_shard_placement)
+      print('---sequence_output-----', self.sequence_output)
 
   def get_sequence_output(self):
     """Gets final hidden layer of encoder.
@@ -391,8 +375,10 @@ def dropout(input_tensor, dropout_prob):
 
 def layer_norm(input_tensor, name=None):
   """Run layer normalization on the last dimension of the tensor."""
+  # return normalization_ops.layer_norm(inputs=input_tensor,
+  #                                  scope=name,trainable = False)
   return tf.contrib.layers.layer_norm(
-      inputs=input_tensor, begin_norm_axis=-1, begin_params_axis=-1, scope=name)
+      inputs=input_tensor, begin_norm_axis=-1, begin_params_axis=-1, scope=name, trainable = False)
 
 
 def layer_norm_and_dropout(input_tensor, dropout_prob, name=None):
@@ -452,12 +438,18 @@ def embedding_lookup(input_ids,
     output = tf.gather(embedding_table, flat_input_ids)
   """
 
+  #output = embedding_lookup_ipu(embedding_table,flat_input_ids, name='emb_lookup_ipu_words')
   output = tf.nn.embedding_lookup(embedding_table,flat_input_ids, name='emb_lookup_ipu_words')
   input_shape = get_shape_list(input_ids)
 
   output = tf.reshape(output,
                       input_shape[0:-1] + [input_shape[-1] * embedding_size])
-  return (output, embedding_table)
+  print('----flat_input_ids----', flat_input_ids)
+  print('----output----', output)
+  print('----embedding_table----', embedding_table)
+  print('----one-hot embedding----', use_one_hot_embeddings, dtype)
+
+  return output
 
 
 def embedding_postprocessor(input_tensor,
@@ -521,6 +513,7 @@ def embedding_postprocessor(input_tensor,
     one_hot_ids = tf.one_hot(flat_token_type_ids, depth=token_type_vocab_size, dtype=dtype)
     token_type_embeddings = tf.matmul(one_hot_ids, token_type_table)
     """
+    #token_type_embeddings = embedding_lookup_ipu(token_type_table, flat_token_type_ids, name='emb_lookup_ipu_token_type')
     token_type_embeddings = tf.nn.embedding_lookup(token_type_table, flat_token_type_ids, name='emb_lookup_ipu_token_type')
     token_type_embeddings = tf.reshape(token_type_embeddings,
                                        [batch_size, seq_length, width])
@@ -868,6 +861,8 @@ def transformer_model(shard_placement,
 
   if do_return_all_layers:
     all_layer_outputs = []
+
+  print('----shard_placement----', shard_placement)
   for layer_idx in range(num_hidden_layers):
     with scopes.ipu_shard(shard_placement[layer_idx]):
       with tf.variable_scope("layer_%d" % layer_idx):

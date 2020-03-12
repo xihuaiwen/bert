@@ -34,37 +34,7 @@ from tensorflow.python.ipu import utils, scopes
 from tensorflow.python.ipu.optimizers import sharded_optimizer
 from tensorflow.python.training import gradient_descent
 import pdb
-
-
-#true to use virtul ipu
-IPU_MODEL = False
-if IPU_MODEL:
-    os.environ['TF_POPLAR_FLAGS'] = "--use_ipu_model"
-class ProfilerHook(tf.train.SessionRunHook):
-    """Estimator hook to generate and write a Poplar report to write_dir"""
-    def __init__(self, write_dir, name=''):
-        self._write_dir = write_dir
-        self._name = name
-
-    def begin(self):
-        from tensorflow.compiler.plugin.poplar.ops import gen_ipu_ops
-        self._report_op = gen_ipu_ops.ipu_event_trace()
-
-    def end(self, session):
-        import os
-        raw_report = session.run(self._report_op)
-        write_file = os.path.join(self._write_dir, f'{self._name}_report.txt')
-        with open(write_file, 'w') as f:
-            f.write(ipu.utils.extract_all_strings_from_event_trace(raw_report))
-        print(f"Wrote profiling report to {write_file}")
-
-profiler_hook = ProfilerHook(write_dir='./profile')
-
-#tf_report
-from tensorflow.compiler.plugin.poplar.ops import gen_ipu_ops
-from gc_profile import save_tf_report
-with tf.device('cpu'):
-    report = gen_ipu_ops.ipu_event_trace()
+from tensorflow.python.ipu.scopes import ipu_scope
 
 flags = tf.flags
 
@@ -202,6 +172,10 @@ flags.DEFINE_float(
     "null_score_diff_threshold", 0.0,
     "If null_score - best_non_null is greater than the threshold predict null.")
 
+#true to use virtul ipu
+IPU_MODEL = False
+if IPU_MODEL:
+    os.environ['TF_POPLAR_FLAGS'] = "--use_ipu_model"
 
 class SquadExample(object):
   """A single training/test example for simple sequence classification.
@@ -289,16 +263,20 @@ def create_estimator_wrapper(FLAGS, model_fn, bert_config):
 
 def create_ipu_estimator(FLAGS, model_fn, bert_config):
   ipu_options = ipu.utils.create_ipu_config(
-                   profiling=FLAGS.ipu_profiling,
-                   use_poplar_text_report=FLAGS.ipu_profiling,
-                   profile_execution=FLAGS.ipu_profiling)
+                   profiling=True,
+                   use_poplar_text_report=False,
+                   #profiling=FLAGS.ipu_profiling,
+                   #use_poplar_text_report=FLAGS.ipu_profiling,
+                   profile_execution=FLAGS.ipu_profiling,
+                   report_directory='./report')
 
   required_ipus = calculate_required_ipus(bert_config)
 
-  ipu_options = ipu.utils.set_convolution_options(ipu_options, {"availableMemoryProportion": "0,23"})
-  ipu_options = ipu.utils.set_matmul_options(ipu_options,{"availableMemoryProportion": "0.23"})
+  ipu_options = ipu.utils.set_convolution_options(ipu_options, {"availableMemoryProportion": "0.1"})
+  ipu_options = ipu.utils.set_matmul_options(ipu_options,{"availableMemoryProportion": "0.1"})
   ipu.utils.set_recomputation_options(ipu_options, allow_recompute=True)
   ipu.utils.set_optimization_options(ipu_options, gather_simplifier=False)
+  print('------ipu_options-----', ipu_options.enable_gather_simplifier)
   cfg = ipu.utils.auto_select_ipus(ipu_options, num_ipus=required_ipus)
 
   from tensorflow.core.protobuf import rewriter_config_pb2
@@ -699,7 +677,7 @@ def create_model_ipu(bert_config, is_training, input_ids, input_mask, segment_id
   seq_length = final_hidden_shape[1]
   hidden_size = final_hidden_shape[2]
 
-  with scopes.ipu_shard(1):
+  with scopes.ipu_shard(11):
     output_weights = tf.get_variable(
         "cls/squad/output_weights", [2, hidden_size],
         dtype = bert_config.dtype,
@@ -826,7 +804,7 @@ def model_fn_builder_ipu(bert_config,init_checkpoint,
       start_positions = features["start_positions"]
       end_positions = features["end_positions"]
 
-      with scopes.ipu_shard(1):
+      with scopes.ipu_shard(11):
         start_loss = compute_loss(start_logits, start_positions)
         end_loss = compute_loss(end_logits, end_positions)
 
@@ -834,7 +812,7 @@ def model_fn_builder_ipu(bert_config,init_checkpoint,
 
       opt = sharded_optimizer.ShardedOptimizer(
                                         gradient_descent.GradientDescentOptimizer(learning_rate))
-      train_op = opt.minimize(total_loss)
+      train_op = opt.minimize(total_loss, aggregation_method=tf.AggregationMethod.ADD_N)
 
       output_spec = tf.estimator.EstimatorSpec(
           mode=mode,
@@ -1441,8 +1419,8 @@ def main(_):
         num_warmup_steps=num_warmup_steps,
         use_tpu=FLAGS.use_tpu,
         use_one_hot_embeddings=FLAGS.use_tpu)
-
-  estimator = create_estimator_wrapper(FLAGS, model_fn, bert_config)
+  with ipu_scope("/device:IPU:0"):
+    estimator = create_estimator_wrapper(FLAGS, model_fn, bert_config)
 
   if FLAGS.do_train:
     # We write to a temporary file to avoid storing very large constant tensors
@@ -1476,7 +1454,7 @@ def main(_):
 
   if FLAGS.do_predict:
     eval_examples = read_squad_examples(
-        input_file=FLAGS.predict_file, is_training=False)[:10]
+        input_file=FLAGS.predict_file,is_training=False)
 
     eval_writer = FeatureWriter(
         filename=os.path.join(FLAGS.output_dir, "eval.tf_record"),
@@ -1513,7 +1491,10 @@ def main(_):
     # If running eval on the TPU, you will need to specify the number of
     # steps.
     all_results = []
-    for result in estimator.predict(predict_input_fn, yield_single_examples=True,hooks=[profiler_hook],num_predictions=len(eval_examples)//FLAGS.predict_batch_size):
+    for result in estimator.predict(
+            predict_input_fn,
+            yield_single_examples=True,
+            num_predictions=len(eval_features)):
       if len(all_results) % 100 == 0:
         tf.logging.info("Processing example: %d" % (len(all_results)))
 
@@ -1525,13 +1506,6 @@ def main(_):
               unique_id=unique_id,
               start_logits=start_logits,
               end_logits=end_logits))
-
-      #tf_report
-      # out = estimator.run(report)
-      # save_tf_report(out)
-
-      # if len(all_results) == 199:
-      #   break
 
     output_prediction_file = os.path.join(FLAGS.output_dir, "predictions.json")
     output_nbest_file = os.path.join(FLAGS.output_dir, "nbest_predictions.json")
