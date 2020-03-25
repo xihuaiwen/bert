@@ -29,7 +29,7 @@ import tensorflow as tf
 from tensorflow.python import ipu
 from tensorflow.python.ipu import utils, scopes
 from tensorflow.python.ipu import normalization_ops
-
+from tensorflow.python.ipu.ops.embedding_ops import embedding_lookup as embedding_lookup_ipu
 
 class BertConfig(object):
   """Configuration for `BertModel`."""
@@ -184,8 +184,9 @@ class BertModel(object):
 
     embedding_shard_placement = { "words_embedding": 0,
             "positional_segment_embedding": 1,
+            "pooler":-1,
             }
-    attention_shard_placement = [(int(math.ceil(i/config.attention_layers_per_ipu)) + 2) for i in range(0,config.num_hidden_layers)]
+    attention_shard_placement = [(int(math.floor(i/config.attention_layers_per_ipu)) + 2) for i in range(0,config.num_hidden_layers)]
 
     print('-----ipu_shard placement----', embedding_shard_placement)
     with tf.variable_scope(scope, default_name="bert"):
@@ -217,13 +218,13 @@ class BertModel(object):
               dropout_prob=config.hidden_dropout_prob,
               dtype=config.dtype)
 
-          # This converts a 2D mask of shape [batch_size, seq_length] to a 3D
-          # mask of shape [batch_size, seq_length, seq_length] which is used
-          # for the attention scores.
-          attention_mask = create_attention_mask_from_input_mask(
-              input_ids, input_mask, config.dtype)
-
       with tf.variable_scope("encoder"):
+
+        # This converts a 2D mask of shape [batch_size, seq_length] to a 3D
+        # mask of shape [batch_size, seq_length, seq_length] which is used
+        # for the attention scores.
+        attention_mask = create_attention_mask_from_input_mask(
+            input_ids, input_mask, config.dtype)
 
         # Run the stacked transformer.
         # `sequence_output` shape = [batch_size, seq_length, hidden_size].
@@ -247,6 +248,17 @@ class BertModel(object):
       print('----attention_shard_placement------', attention_shard_placement)
       print('---sequence_output-----', self.sequence_output)
 
+      with tf.variable_scope("pooler"):
+        with scopes.ipu_shard(attention_shard_placement[embedding_shard_placement["pooler"]]):
+        # We "pool" the model by simply taking the hidden state corresponding
+        # to the first token. We assume that this has been pre-trained
+          first_token_tensor = tf.squeeze(self.sequence_output[:, 0:1, :], axis=1)
+          self.pooled_output = tf.layers.dense(
+              first_token_tensor,
+              config.hidden_size,
+              activation=tf.tanh,
+              kernel_initializer=create_initializer(config.initializer_range))
+
   def get_sequence_output(self):
     """Gets final hidden layer of encoder.
 
@@ -255,6 +267,9 @@ class BertModel(object):
       to the final hidden of the transformer encoder.
     """
     return self.sequence_output
+
+  def get_pooled_output(self):
+    return self.pooled_output
 
   def get_all_encoder_layers(self):
     return self.all_encoder_layers
@@ -378,7 +393,7 @@ def layer_norm(input_tensor, name=None):
   # return normalization_ops.layer_norm(inputs=input_tensor,
   #                                  scope=name,trainable = False)
   return tf.contrib.layers.layer_norm(
-      inputs=input_tensor, begin_norm_axis=-1, begin_params_axis=-1, scope=name, trainable = False)
+        inputs=input_tensor, begin_norm_axis=-1, begin_params_axis=-1, scope=name)
 
 
 def layer_norm_and_dropout(input_tensor, dropout_prob, name=None):
@@ -438,8 +453,8 @@ def embedding_lookup(input_ids,
     output = tf.gather(embedding_table, flat_input_ids)
   """
 
-  #output = embedding_lookup_ipu(embedding_table,flat_input_ids, name='emb_lookup_ipu_words')
-  output = tf.nn.embedding_lookup(embedding_table,flat_input_ids, name='emb_lookup_ipu_words')
+  output = embedding_lookup_ipu(embedding_table,flat_input_ids, name='emb_lookup_ipu_words')
+  #output = tf.nn.embedding_lookup(embedding_table,flat_input_ids, name='emb_lookup_ipu_words')
   input_shape = get_shape_list(input_ids)
 
   output = tf.reshape(output,

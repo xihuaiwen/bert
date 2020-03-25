@@ -25,6 +25,15 @@ import modeling
 import optimization
 import tokenization
 import tensorflow as tf
+import modeling_ipu
+
+from tensorflow.python import ipu
+from tensorflow.python.ipu import utils, scopes
+from tensorflow.python.ipu.optimizers import sharded_optimizer
+from tensorflow.python.training import gradient_descent
+import pdb
+from tensorflow.python.ipu.scopes import ipu_scope
+import math
 
 flags = tf.flags
 
@@ -87,14 +96,14 @@ flags.DEFINE_float("num_train_epochs", 3.0,
                    "Total number of training epochs to perform.")
 
 flags.DEFINE_float(
-    "warmup_proportion", 0.1,
+    "warmup_proportion", 0.16,
     "Proportion of training to perform linear learning rate warmup for. "
     "E.g., 0.1 = 10% of training.")
 
 flags.DEFINE_integer("save_checkpoints_steps", 1000,
                      "How often to save the model checkpoint.")
 
-flags.DEFINE_integer("iterations_per_loop", 1000,
+flags.DEFINE_integer("iterations_per_loop", 1,
                      "How many steps to make in each estimator call.")
 
 flags.DEFINE_bool("use_tpu", False, "Whether to use TPU or GPU/CPU.")
@@ -116,6 +125,16 @@ tf.flags.DEFINE_string(
     "[Optional] Project name for the Cloud TPU-enabled project. If not "
     "specified, we will attempt to automatically detect the GCE project from "
     "metadata.")
+
+flags.DEFINE_bool("use_ipu", False, "Whether to use Graphcore IPU.")
+
+flags.DEFINE_bool("ipu_profiling", False, "Whether to enable profiling for Graphcore IPU.")
+
+flags.DEFINE_integer("ipu_log_interval", 100, "Interval at which to log progress.")
+
+flags.DEFINE_integer("ipu_summary_interval", 1, "Interval at which to write summaries.")
+
+flags.DEFINE_integer("attention_layers_per_ipu", 1 , "How many attention layers per Graphcore IPU.")
 
 tf.flags.DEFINE_string("master", None, "[Optional] TensorFlow master URL.")
 
@@ -173,6 +192,248 @@ class InputFeatures(object):
     self.label_id = label_id
     self.is_real_example = is_real_example
 
+
+def calculate_required_ipus(bert_config):
+  required_ipus = int(math.ceil(float(bert_config.num_hidden_layers) / bert_config.attention_layers_per_ipu)) + 2
+  num_ipus_list = [2,4,8,16]
+  for nums in num_ipus_list:
+    if nums >= required_ipus:
+      return nums
+  print ("Cannot meet the IPU resource allocation request, you required %d" % (required_ipus))
+  sys.exit(1)
+
+def create_estimator_wrapper(FLAGS, model_fn, bert_config):
+  if FLAGS.use_ipu:
+    return create_ipu_estimator(FLAGS, model_fn, bert_config)
+  else:
+    return create_estimator(FLAGS, model_fn, bert_config)
+
+def create_ipu_estimator(FLAGS, model_fn, bert_config):
+  ipu_options = ipu.utils.create_ipu_config(
+                   use_poplar_text_report=False,
+                   profiling=FLAGS.ipu_profiling,
+                   #use_poplar_text_report=FLAGS.ipu_profiling,
+                   profile_execution=FLAGS.ipu_profiling,
+                   report_directory='./report')
+
+  required_ipus = calculate_required_ipus(bert_config)
+
+  ipu_options = ipu.utils.set_convolution_options(ipu_options, {"availableMemoryProportion": "0.1"})
+  ipu_options = ipu.utils.set_matmul_options(ipu_options,{"availableMemoryProportion": "0.1"})
+  ipu.utils.set_recomputation_options(ipu_options, allow_recompute=True)
+  ipu.utils.set_optimization_options(ipu_options, gather_simplifier=False)
+  print('------ipu_options-----', ipu_options.enable_gather_simplifier)
+  cfg = ipu.utils.auto_select_ipus(ipu_options, num_ipus=required_ipus)
+
+  
+  """
+  # Get the cluster configuration from the TF_CONFIG environment variable.
+  cluster = tf.distribute.cluster_resolver.TFConfigClusterResolver()
+  # Create strategy that places variables (including momentums) on the host.
+  strategy = ipu.ipu_multi_worker_strategy.IPUMultiWorkerStrategy(
+  cluster, variables_on_host=True)
+  """
+
+  from tensorflow.core.protobuf import rewriter_config_pb2
+  sess_cfg = tf.ConfigProto()
+  sess_cfg.graph_options.rewrite_options.memory_optimization = (rewriter_config_pb2.RewriterConfig.OFF)
+
+  ipu_run_config = ipu.ipu_run_config.IPURunConfig(
+                     iterations_per_loop=FLAGS.iterations_per_loop,
+                     ipu_options=ipu_options,
+                     num_shards=required_ipus)
+
+  config = ipu.ipu_run_config.RunConfig(
+                    ipu_run_config=ipu_run_config,
+                    session_config=sess_cfg,
+                    log_step_count_steps=FLAGS.ipu_log_interval,
+                    save_summary_steps=FLAGS.ipu_summary_interval,
+                    model_dir=FLAGS.output_dir)
+ #                   train_distribute=strategy)
+
+  if (FLAGS.init_checkpoint):
+    warm_start_settings = tf.estimator.WarmStartSettings(
+      ckpt_to_initialize_from=FLAGS.init_checkpoint,
+      vars_to_warm_start = ".*bert*.*"
+    )
+    return ipu.ipu_estimator.IPUEstimator(
+          config=config,
+          model_fn=model_fn,
+          params={"learning_rate": FLAGS.learning_rate,
+          "batch_size":FLAGS.train_batch_size},warm_start_from=warm_start_settings)
+  else:
+    return ipu.ipu_estimator.IPUEstimator(
+            config=config,
+            model_fn=model_fn,
+            params={"learning_rate": FLAGS.learning_rate,
+            "batch_size":FLAGS.train_batch_size})
+
+def create_estimator(FLAGS, model_fn, bert_config):
+  tpu_cluster_resolver = None
+  if FLAGS.use_tpu and FLAGS.tpu_name:
+    tpu_cluster_resolver = tf.distribute.cluster_resolver.TPUClusterResolver(
+        FLAGS.tpu_name, zone=FLAGS.tpu_zone, project=FLAGS.gcp_project)
+
+  is_per_host = tf.compat.v1.estimator.tpu.InputPipelineConfig.PER_HOST_V2
+  run_config = tf.compat.v1.estimator.tpu.RunConfig(
+      cluster=tpu_cluster_resolver,
+      master=FLAGS.master,
+      model_dir=FLAGS.output_dir,
+      save_checkpoints_steps=FLAGS.save_checkpoints_steps,
+      tpu_config=tf.compat.v1.estimator.tpu.TPUConfig(
+      iterations_per_loop=FLAGS.iterations_per_loop,
+      num_shards=FLAGS.num_tpu_cores,
+      per_host_input_for_training=is_per_host))
+
+  return tf.compat.v1.estimator.tpu.TPUEstimator(
+      use_tpu=FLAGS.use_tpu,
+      model_fn=model_fn,
+      config=run_config,
+      train_batch_size=FLAGS.train_batch_size,
+      predict_batch_size=FLAGS.predict_batch_size)
+
+
+
+def create_model_ipu(bert_config, label_ids, num_labels, is_training, input_ids, input_mask, segment_ids,
+                 use_one_hot_embeddings):
+  """Creates a classification model."""
+  model = modeling_ipu.BertModel(
+      config=bert_config,
+      is_training=is_training,
+      input_ids=input_ids,
+      input_mask=input_mask,
+      token_type_ids=segment_ids,
+      use_one_hot_embeddings=use_one_hot_embeddings)
+
+  output_layer = model.get_pooled_output()
+  hidden_size = output_layer.shape[-1].value
+
+  with scopes.ipu_shard(calculate_required_ipus(bert_config)-1):
+    output_weights = tf.get_variable(
+        "output_weights", [num_labels, hidden_size],
+        dtype = bert_config.dtype,
+        initializer=tf.truncated_normal_initializer(stddev=0.02))
+
+    output_bias = tf.get_variable(
+        "output_bias", [num_labels], 
+        dtype = bert_config.dtype,
+        initializer=tf.zeros_initializer())
+
+    if is_training:
+      # I.e., 0.1 dropout
+      output_layer = tf.nn.dropout(output_layer, keep_prob=0.9)
+    
+    logits = tf.matmul(output_layer, output_weights, transpose_b=True)
+    logits = tf.nn.bias_add(logits, output_bias)
+    probabilities = tf.nn.softmax(logits, axis=-1)
+    log_probs = tf.nn.log_softmax(logits, axis=-1)
+
+    one_hot_labels = tf.one_hot(label_ids, depth=num_labels, dtype=bert_config.dtype)
+
+    per_example_loss = -tf.reduce_sum(one_hot_labels * log_probs, axis=-1)
+    loss = tf.reduce_mean(per_example_loss)
+
+  return (loss, per_example_loss, logits, probabilities, model)
+
+
+def model_fn_builder_ipu(bert_config,num_labels,init_checkpoint,
+                         learning_rate,num_train_steps,num_warmup_steps):
+  """Returns `model_fn` closure for IPUEstimator."""
+
+  def model_fn(features, labels, mode, params):  # pylint: disable=unused-argument
+    """The `model_fn` for TPUEstimator."""
+
+    tf.logging.info("*** Features ***")
+    for name in sorted(features.keys()):
+      tf.logging.info("  name = %s, shape = %s" % (name, features[name].shape))
+
+    input_ids = features["input_ids"]
+    input_mask = features["input_mask"]
+    segment_ids = features["segment_ids"]
+    label_ids = features["label_ids"]
+    is_real_example = None
+
+    if "is_real_example" in features:
+      is_real_example = tf.cast(features["is_real_example"], dtype=tf.float32)
+    else:
+      is_real_example = tf.ones(tf.shape(label_ids), dtype=tf.float32)
+
+    is_training = (mode == tf.estimator.ModeKeys.TRAIN)
+
+    (total_loss, per_example_loss, logits, probabilities, model) = create_model_ipu(
+        bert_config=bert_config,
+        label_ids=label_ids,
+        num_labels=num_labels,
+        is_training=is_training,
+        input_ids=input_ids,
+        input_mask=input_mask,
+        segment_ids=segment_ids,
+        use_one_hot_embeddings=False)
+
+    '''
+    tvars = tf.trainable_variables()
+    initialized_variable_names = {}
+    scaffold_fn = None
+    if init_checkpoint:
+      (assignment_map, initialized_variable_names
+      ) = modeling_ipu.get_assignment_map_from_checkpoint(tvars, init_checkpoint)
+      tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
+      print("######################################################")
+      print(assignment_map)
+      print("######################################################")
+    tf.logging.info("**** Trainable Variables ****")
+    for var in tvars:
+      init_string = ""
+      if var.name in initialized_variable_names:
+        init_string = ", *INIT_FROM_CKPT*"
+      tf.logging.info("  name = %s, shape = %s%s", var.name, var.shape,
+                      init_string)
+                      '''
+                      
+
+    output_spec = None
+    if mode == tf.estimator.ModeKeys.TRAIN:
+      ###############adam#################
+      '''
+      optimizer = tf.compat.v1.train.AdamOptimizer()
+      pdb.set_trace()
+      variables = tf.trainable_variables
+      variables = [var for var in variables()] 
+      def host_model_fn(*host_gradients):
+        # This will allreduce the gradients and update the weights on the host.
+        return optimizer.apply_gradients(zip(host_gradients, variables))
+      train_op = tf.identity(total_loss)
+      grads_and_vars = optimizer.compute_gradients(total_loss, var_list=variables)
+      gradients = [g for (g, _) in grads_and_vars]
+      host_call = (host_model_fn, gradients)
+      '''
+      ###############SGD#################
+      opt = sharded_optimizer.ShardedOptimizer(
+                                        gradient_descent.GradientDescentOptimizer(learning_rate))
+      train_op = opt.minimize(total_loss)
+      
+      output_spec = ipu.ipu_estimator.IPUEstimatorSpec(
+          mode=mode,
+          loss=total_loss,
+          train_op=train_op)
+    elif mode == tf.estimator.ModeKeys.EVAL:
+      predictions = tf.argmax(logits, axis=-1, output_type=tf.int32)
+      eval_metric_ops = {
+      "eval_accuracy": tf.metrics.accuracy(labels=label_ids,predictions=predictions),
+      "eval_loss":tf.metrics.mean(values=per_example_loss)
+      }
+      output_spec = tf.estimator.EstimatorSpec(
+          mode=mode,
+          loss=total_loss,
+          eval_metric_ops=eval_metric_ops)
+    else:
+      output_spec = tf.contrib.tpu.TPUEstimatorSpec(
+          mode=mode,
+          predictions={"probabilities": probabilities},
+          scaffold_fn=scaffold_fn)
+
+    return output_spec
+  return model_fn
 
 class DataProcessor(object):
   """Base class for data converters for sequence classification data sets."""
@@ -536,6 +797,9 @@ def file_based_input_fn_builder(input_file, seq_length, is_training,
     """The actual input function."""
     batch_size = params["batch_size"]
 
+    if FLAGS.do_eval:
+      batch_size = FLAGS.eval_batch_size
+
     # For training, we want a lot of parallel reading and shuffling.
     # For eval, we want no shuffling and parallel reading doesn't matter.
     d = tf.data.TFRecordDataset(input_file)
@@ -797,7 +1061,8 @@ def main(_):
     raise ValueError(
         "At least one of `do_train`, `do_eval` or `do_predict' must be True.")
 
-  bert_config = modeling.BertConfig.from_json_file(FLAGS.bert_config_file)
+  bert_config = modeling_ipu.BertConfig.from_json_file(FLAGS.bert_config_file)
+  bert_config.attention_layers_per_ipu = FLAGS.attention_layers_per_ipu
 
   if FLAGS.max_seq_length > bert_config.max_position_embeddings:
     raise ValueError(
@@ -844,25 +1109,36 @@ def main(_):
         len(train_examples) / FLAGS.train_batch_size * FLAGS.num_train_epochs)
     num_warmup_steps = int(num_train_steps * FLAGS.warmup_proportion)
 
-  model_fn = model_fn_builder(
-      bert_config=bert_config,
-      num_labels=len(label_list),
-      init_checkpoint=FLAGS.init_checkpoint,
-      learning_rate=FLAGS.learning_rate,
-      num_train_steps=num_train_steps,
-      num_warmup_steps=num_warmup_steps,
-      use_tpu=FLAGS.use_tpu,
-      use_one_hot_embeddings=FLAGS.use_tpu)
+  if FLAGS.use_ipu:
+    model_fn = model_fn_builder_ipu(
+        bert_config=bert_config,
+        num_labels=len(label_list),
+        init_checkpoint=FLAGS.init_checkpoint,
+        learning_rate=FLAGS.learning_rate,
+        num_train_steps=num_train_steps,
+        num_warmup_steps=num_warmup_steps)
+  else:
+    model_fn = model_fn_builder(
+        bert_config=bert_config,
+        num_labels=len(label_list),
+        init_checkpoint=FLAGS.init_checkpoint,
+        learning_rate=FLAGS.learning_rate,
+        num_train_steps=num_train_steps,
+        num_warmup_steps=num_warmup_steps,
+        use_tpu=FLAGS.use_tpu,
+        use_one_hot_embeddings=FLAGS.use_tpu)
 
   # If TPU is not available, this will fall back to normal Estimator on CPU
   # or GPU.
-  estimator = tf.contrib.tpu.TPUEstimator(
-      use_tpu=FLAGS.use_tpu,
-      model_fn=model_fn,
-      config=run_config,
-      train_batch_size=FLAGS.train_batch_size,
-      eval_batch_size=FLAGS.eval_batch_size,
-      predict_batch_size=FLAGS.predict_batch_size)
+  with ipu_scope("/device:IPU:0"):
+    estimator = create_estimator_wrapper(FLAGS, model_fn, bert_config)
+    '''estimator = tf.contrib.tpu.TPUEstimator(
+        use_tpu=FLAGS.use_tpu,
+        model_fn=model_fn,
+        config=run_config,
+        train_batch_size=FLAGS.train_batch_size,
+        eval_batch_size=FLAGS.eval_batch_size,
+        predict_batch_size=FLAGS.predict_batch_size)'''
 
   if FLAGS.do_train:
     train_file = os.path.join(FLAGS.output_dir, "train.tf_record")
@@ -905,11 +1181,12 @@ def main(_):
     eval_steps = None
     # However, if running eval on the TPU, you will need to specify the
     # number of steps.
-    if FLAGS.use_tpu:
+    # pdb.set_trace()
+    if FLAGS.use_tpu or FLAGS.use_ipu:
       assert len(eval_examples) % FLAGS.eval_batch_size == 0
       eval_steps = int(len(eval_examples) // FLAGS.eval_batch_size)
 
-    eval_drop_remainder = True if FLAGS.use_tpu else False
+    eval_drop_remainder = True if FLAGS.use_tpu or FLAGS.use_ipu else False
     eval_input_fn = file_based_input_fn_builder(
         input_file=eval_file,
         seq_length=FLAGS.max_seq_length,

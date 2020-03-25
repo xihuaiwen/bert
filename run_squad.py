@@ -125,7 +125,7 @@ flags.DEFINE_bool("use_fp16", False, "Whether to use half precision float to tra
 
 flags.DEFINE_bool("use_ipu", False, "Whether to use Graphcore IPU.")
 
-flags.DEFINE_bool("ipu_profiling", True, "Whether to enable profiling for Graphcore IPU.")
+flags.DEFINE_bool("ipu_profiling", False, "Whether to enable profiling for Graphcore IPU.")
 
 flags.DEFINE_integer("ipu_log_interval", 100, "Interval at which to log progress.")
 
@@ -263,9 +263,8 @@ def create_estimator_wrapper(FLAGS, model_fn, bert_config):
 
 def create_ipu_estimator(FLAGS, model_fn, bert_config):
   ipu_options = ipu.utils.create_ipu_config(
-                   profiling=True,
                    use_poplar_text_report=False,
-                   #profiling=FLAGS.ipu_profiling,
+                   profiling=FLAGS.ipu_profiling,
                    #use_poplar_text_report=FLAGS.ipu_profiling,
                    profile_execution=FLAGS.ipu_profiling,
                    report_directory='./report')
@@ -669,7 +668,6 @@ def create_model_ipu(bert_config, is_training, input_ids, input_mask, segment_id
       token_type_ids=segment_ids,
       use_one_hot_embeddings=use_one_hot_embeddings)
 
-  # pdb.set_trace()
   final_hidden = model.get_sequence_output()
 
   final_hidden_shape = modeling_ipu.get_shape_list(final_hidden, expected_rank=3)
@@ -677,7 +675,7 @@ def create_model_ipu(bert_config, is_training, input_ids, input_mask, segment_id
   seq_length = final_hidden_shape[1]
   hidden_size = final_hidden_shape[2]
 
-  with scopes.ipu_shard(11):
+  with scopes.ipu_shard(3):
     output_weights = tf.get_variable(
         "cls/squad/output_weights", [2, hidden_size],
         dtype = bert_config.dtype,
@@ -770,8 +768,8 @@ def model_fn_builder_ipu(bert_config,init_checkpoint,
         segment_ids=segment_ids,
         use_one_hot_embeddings=False)
 
+    '''
     tvars = tf.trainable_variables()
-
     initialized_variable_names = {}
     scaffold_fn = None
     if init_checkpoint:
@@ -781,7 +779,6 @@ def model_fn_builder_ipu(bert_config,init_checkpoint,
       print("######################################################")
       print(assignment_map)
       print("######################################################")
-
     tf.logging.info("**** Trainable Variables ****")
     for var in tvars:
       init_string = ""
@@ -789,6 +786,7 @@ def model_fn_builder_ipu(bert_config,init_checkpoint,
         init_string = ", *INIT_FROM_CKPT*"
       tf.logging.info("  name = %s, shape = %s%s", var.name, var.shape,
                       init_string)
+                      '''
 
     output_spec = None
     if mode == tf.estimator.ModeKeys.TRAIN:
@@ -804,7 +802,7 @@ def model_fn_builder_ipu(bert_config,init_checkpoint,
       start_positions = features["start_positions"]
       end_positions = features["end_positions"]
 
-      with scopes.ipu_shard(11):
+      with scopes.ipu_shard(3):
         start_loss = compute_loss(start_logits, start_positions)
         end_loss = compute_loss(end_logits, end_positions)
 
@@ -960,16 +958,13 @@ def input_fn_builder(input_file, seq_length, is_training, drop_remainder):
   def input_fn(params):
     """The actual input function."""
     batch_size = params["batch_size"]
-    print("###########################predict batch size##################################"+str(batch_size))
     # For training, we want a lot of parallel reading and shuffling.
     # For eval, we want no shuffling and parallel reading doesn't matter.
-    # pdb.set_trace()
+
     d = tf.data.TFRecordDataset(input_file)
     if is_training:
       d = d.repeat()
       d = d.shuffle(buffer_size=100)
-    # pdb.set_trace()
-    # d=d.repeat()
     d = d.apply(
         tf.contrib.data.map_and_batch(
             lambda record: _decode_record(record, name_to_features),
@@ -991,7 +986,7 @@ def write_predictions(all_examples, all_features, all_results, n_best_size,
   """Write final predictions to the json file and log-odds of null if needed."""
   tf.logging.info("Writing predictions to: %s" % (output_prediction_file))
   tf.logging.info("Writing nbest to: %s" % (output_nbest_file))
-  # pdb.set_trace()
+
   example_index_to_features = collections.defaultdict(list)
   for feature in all_features:
     example_index_to_features[feature.example_index].append(feature)
@@ -1018,9 +1013,6 @@ def write_predictions(all_examples, all_features, all_results, n_best_size,
     null_start_logit = 0  # the start logit at the slice with min null score
     null_end_logit = 0  # the end logit at the slice with min null score
     for (feature_index, feature) in enumerate(features):
-      # pdb.set_trace()
-      if feature.unique_id >= len(unique_id_to_result):
-        continue
       result = unique_id_to_result[feature.unique_id]
       start_indexes = _get_best_indexes(result.start_logits, n_best_size)
       end_indexes = _get_best_indexes(result.end_logits, n_best_size)
@@ -1494,13 +1486,45 @@ def main(_):
     for result in estimator.predict(
             predict_input_fn,
             yield_single_examples=True,
-            num_predictions=len(eval_features)):
+            num_predictions=len(eval_features),
+            checkpoint_path=FLAGS.init_checkpoint):
       if len(all_results) % 100 == 0:
         tf.logging.info("Processing example: %d" % (len(all_results)))
 
+      
       unique_id = int(result["unique_ids"])
       start_logits = [float(x) for x in result["start_logits"].flat]
       end_logits = [float(x) for x in result["end_logits"].flat]
+
+      '''
+      sequence_output = [float(x) for x in result["final_hidden"].flat]
+      input_ids = [float(x) for x in result["input_ids"].flat]
+      input_mask = [float(x) for x in result["input_mask"].flat]
+      token_type_ids = [float(x) for x in result["token_type_ids"].flat]  
+      embedding_output = [float(x) for x in result["embedding_output"].flat]
+      embedding_lookup = [float(x) for x in result["embedding_lookup"].flat]
+
+      print("unique_id"+str(unique_id))
+      print("len:"+str(len(start_logits))+" start_logits"+str(start_logits))
+      print("len:"+str(len(end_logits))+" end_logits"+str(end_logits))
+
+      embedding_str=''
+      for item in embedding_output:
+        embedding_str += str(item)+'\n'
+      embedding_lookup_str=''
+      for item in embedding_lookup:
+        embedding_lookup_str += str(item)+'\n'    
+      str_result = "sequence_output:"+str(sequence_output)+'\n' \
+      +"input_ids:"+str(input_ids)+'\n' \
+      +"input_mask:"+str(input_mask)+'\n' \
+      +"token_type_ids:"+str(token_type_ids)+'\n' \
+      +"embedding_output:"+embedding_str+'\n' \
+      +"embedding_lookup:"+embedding_lookup_str+'\n'
+      with open("./ipu-result.txt","w") as wrfile:
+        wrfile.write(str_result)  
+      # break
+      '''
+
       all_results.append(
           RawResult(
               unique_id=unique_id,
